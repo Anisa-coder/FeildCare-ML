@@ -1,0 +1,18 @@
+1 Healthy Corn
+2 Corn Eyespot
+3 Corn Northern Leaf Blight
+4 Corn Southern Leaf Blight
+5 Corn Curvularia Leaf Spot
+6 Corn Gray Leaf Spot
+7 Corn Viral Disease
+8 Corn Rust
+9 Tomato Septoria Leaf Spot
+10 Tomato Gray Leaf Spot
+11 Tomato Healthy
+12 Tomato Bacterial Spot
+13 Tomato Early Blight
+14 Tomato Late Blight
+15 Tomato Leaf Mold
+16 Tomato Target Spot
+17 Tomato Yellow Leaf Curl Virus
+18 Tomato Spider Mites Two-spotted Spider Mite

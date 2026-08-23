@@ -1,0 +1,962 @@
+{
+  "dataset_root": "E:\\Ahana-Codes\\FeildCare\\dataset",
+  "total_images": 20390,
+  "distribution": {
+    "counts": {
+      "1": 1600,
+      "2": 150,
+      "3": 1156,
+      "4": 285,
+      "5": 60,
+      "6": 936,
+      "7": 500,
+      "8": 1824,
+      "9": 1897,
+      "10": 77,
+      "11": 1742,
+      "12": 1244,
+      "13": 1298,
+      "14": 1779,
+      "15": 1352,
+      "16": 1503,
+      "17": 1190,
+      "18": 1797
+    },
+    "total": 20390,
+    "minimum": 60,
+    "maximum": 1897,
+    "ratio": 31.616666666666667
+  },
+  "labels": {
+    "1": "Healthy Corn",
+    "2": "Corn Eyespot",
+    "3": "Corn Northern Leaf Blight",
+    "4": "Corn Southern Leaf Blight",
+    "5": "Corn Curvularia Leaf Spot",
+    "6": "Corn Gray Leaf Spot",
+    "7": "Corn Viral Disease",
+    "8": "Corn Rust",
+    "9": "Tomato Septoria Leaf Spot",
+    "10": "Tomato Gray Leaf Spot",
+    "11": "Tomato Healthy",
+    "12": "Tomato Bacterial Spot",
+    "13": "Tomato Early Blight",
+    "14": "Tomato Late Blight",
+    "15": "Tomato Leaf Mold",
+    "16": "Tomato Target Spot",
+    "17": "Tomato Yellow Leaf Curl Virus",
+    "18": "Tomato Spider Mites Two-spotted Spider Mite"
+  },
+  "imbalance": {
+    "median": 1271.0,
+    "mean": 1132.7777777777778,
+    "max": 1897,
+    "min": 60,
+    "max_to_min": 31.616666666666667,
+    "classes_below_25pct_median": [
+      2,
+      4,
+      5,
+      10
+    ],
+    "classes_below_50pct_median": [
+      2,
+      4,
+      5,
+      7,
+      10
+    ],
+    "classes_above_2x_median": []
+  },
+  "completeness": {
+    "expected_classes": 18,
+    "classes_with_images": 18,
+    "empty_classes": [],
+    "unexpected_numeric_folders": []
+  },
+  "quality": {
+    "total_records": 20390,
+    "valid": 20390,
+    "corrupt": 0,
+    "small": 1,
+    "extreme_aspect": 6,
+    "grayscale": 0,
+    "alpha": 0,
+    "tiny_files": 0,
+    "large_files": 0,
+    "formats": {
+      "jpeg": 20390
+    },
+    "modes": {
+      "RGB": 20390
+    },
+    "dimensions": {
+      "min_width": 180,
+      "median_width": 256.0,
+      "min_height": 116,
+      "median_height": 256.0,
+      "min_pixels": 33872,
+      "median_pixels": 65536.0
+    },
+    "aspect_ratio": {
+      "minimum": 0.2878541191794204,
+      "median": 1.0,
+      "maximum": 3.7478991596638656
+    },
+    "file_size": {
+      "total_bytes": 2657670511,
+      "median_bytes": 32078.5,
+      "mean_bytes": 130341.85929377146,
+      "maximum_bytes": 5253168
+    },
+    "corrupt_examples": [],
+    "small_examples": [
+      "dataset\\8\\corn_hf_train_003711.jpg"
+    ],
+    "aspect_examples": [
+      "dataset\\3\\corn_hf_train_002032.jpg",
+      "dataset\\3\\corn_hf_train_002293.jpg",
+      "dataset\\6\\corn_hf_train_001250.jpg",
+      "dataset\\8\\corn_hf_train_002891.jpg",
+      "dataset\\8\\corn_hf_train_003131.jpg",
+      "dataset\\8\\corn_hf_train_004024.jpg"
+    ],
+    "tiny_file_examples": []
+  },
+  "class_quality": {
+    "1": {
+      "total": 1600,
+      "valid": 1600,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 224,
+        "median": 256.0,
+        "mean": 384.736875,
+        "p10": 224.0,
+        "p90": 256.0,
+        "max": 5188
+      },
+      "height": {
+        "min": 224,
+        "median": 256.0,
+        "mean": 482.71625,
+        "p10": 224.0,
+        "p90": 256.0,
+        "max": 8064
+      },
+      "pixels": {
+        "min": 50176,
+        "median": 65536.0,
+        "mean": 671285.39875,
+        "max": 36642816
+      },
+      "file_size": {
+        "min": 5691,
+        "median": 22058.0,
+        "mean": 123407.71375,
+        "max": 4166078
+      },
+      "formats": {
+        "jpeg": 1600
+      },
+      "modes": {
+        "RGB": 1600
+      }
+    },
+    "10": {
+      "total": 77,
+      "valid": 77,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 227,
+        "median": 227,
+        "mean": 230.76623376623377,
+        "p10": 227.0,
+        "p90": 256.0,
+        "max": 256
+      },
+      "height": {
+        "min": 227,
+        "median": 227,
+        "mean": 230.76623376623377,
+        "p10": 227.0,
+        "p90": 256.0,
+        "max": 256
+      },
+      "pixels": {
+        "min": 51529,
+        "median": 51529,
+        "mean": 53348.09090909091,
+        "max": 65536
+      },
+      "file_size": {
+        "min": 5434,
+        "median": 9136,
+        "mean": 9225.324675324675,
+        "max": 13840
+      },
+      "formats": {
+        "jpeg": 77
+      },
+      "modes": {
+        "RGB": 77
+      }
+    },
+    "11": {
+      "total": 1742,
+      "valid": 1742,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 256.0,
+        "mean": 399.54936854190584,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 4096
+      },
+      "height": {
+        "min": 256,
+        "median": 256.0,
+        "mean": 427.0665901262916,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 4096
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 65536.0,
+        "mean": 547292.9225028703,
+        "max": 12582912
+      },
+      "file_size": {
+        "min": 17908,
+        "median": 48702.5,
+        "mean": 112024.34557979334,
+        "max": 3310879
+      },
+      "formats": {
+        "jpeg": 1742
+      },
+      "modes": {
+        "RGB": 1742
+      }
+    },
+    "12": {
+      "total": 1244,
+      "valid": 1244,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 256.0,
+        "mean": 261.70819935691316,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 3072
+      },
+      "height": {
+        "min": 256,
+        "median": 256.0,
+        "mean": 263.7130225080386,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 4096
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 65536.0,
+        "mean": 87134.69372990353,
+        "max": 12582912
+      },
+      "file_size": {
+        "min": 13817,
+        "median": 24874.0,
+        "mean": 26524.24356913183,
+        "max": 1247022
+      },
+      "formats": {
+        "jpeg": 1244
+      },
+      "modes": {
+        "RGB": 1244
+      }
+    },
+    "13": {
+      "total": 1298,
+      "valid": 1298,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 256.0,
+        "mean": 659.0554699537751,
+        "p10": 256.0,
+        "p90": 2143.899999999944,
+        "max": 4096
+      },
+      "height": {
+        "min": 256,
+        "median": 256.0,
+        "mean": 658.271186440678,
+        "p10": 256.0,
+        "p90": 1598.9999999999577,
+        "max": 4096
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 65536.0,
+        "mean": 1274872.1417565485,
+        "max": 12582912
+      },
+      "file_size": {
+        "min": 14084,
+        "median": 31445.5,
+        "mean": 262042.01001540833,
+        "max": 4009921
+      },
+      "formats": {
+        "jpeg": 1298
+      },
+      "modes": {
+        "RGB": 1298
+      }
+    },
+    "14": {
+      "total": 1779,
+      "valid": 1779,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 256,
+        "mean": 257.27993254637437,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 1200
+      },
+      "height": {
+        "min": 256,
+        "median": 256,
+        "mean": 257.8397976391231,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 1600
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 65536,
+        "mean": 67773.03035413154,
+        "max": 1920000
+      },
+      "file_size": {
+        "min": 5192,
+        "median": 26239,
+        "mean": 25917.93760539629,
+        "max": 191893
+      },
+      "formats": {
+        "jpeg": 1779
+      },
+      "modes": {
+        "RGB": 1779
+      }
+    },
+    "15": {
+      "total": 1352,
+      "valid": 1352,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 256.0,
+        "mean": 630.4977810650887,
+        "p10": 256.0,
+        "p90": 1040.0,
+        "max": 4096
+      },
+      "height": {
+        "min": 256,
+        "median": 256.0,
+        "mean": 691.7418639053254,
+        "p10": 256.0,
+        "p90": 1280.0,
+        "max": 4096
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 65536.0,
+        "mean": 1160937.0192307692,
+        "max": 12582912
+      },
+      "file_size": {
+        "min": 16419,
+        "median": 35272.5,
+        "mean": 204935.44082840238,
+        "max": 3617358
+      },
+      "formats": {
+        "jpeg": 1352
+      },
+      "modes": {
+        "RGB": 1352
+      }
+    },
+    "16": {
+      "total": 1503,
+      "valid": 1503,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 256,
+        "mean": 257.0459081836327,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 780
+      },
+      "height": {
+        "min": 256,
+        "median": 256,
+        "mean": 257.56487025948104,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 1040
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 65536,
+        "mean": 67024.35129740518,
+        "max": 811200
+      },
+      "file_size": {
+        "min": 18487,
+        "median": 39531,
+        "mean": 38864.94477711244,
+        "max": 85409
+      },
+      "formats": {
+        "jpeg": 1503
+      },
+      "modes": {
+        "RGB": 1503
+      }
+    },
+    "17": {
+      "total": 1190,
+      "valid": 1190,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 256.0,
+        "mean": 256,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 256
+      },
+      "height": {
+        "min": 256,
+        "median": 256.0,
+        "mean": 256,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 256
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 65536.0,
+        "mean": 65536,
+        "max": 65536
+      },
+      "file_size": {
+        "min": 10608,
+        "median": 21161.0,
+        "mean": 24675.259663865545,
+        "max": 45581
+      },
+      "formats": {
+        "jpeg": 1190
+      },
+      "modes": {
+        "RGB": 1190
+      }
+    },
+    "18": {
+      "total": 1797,
+      "valid": 1797,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 256,
+        "mean": 260.9638286032276,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 4000
+      },
+      "height": {
+        "min": 256,
+        "median": 256,
+        "mean": 261.14190317195323,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 4000
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 65536,
+        "mean": 80760.6633277685,
+        "max": 12000000
+      },
+      "file_size": {
+        "min": 18159,
+        "median": 38790,
+        "mean": 41043.5898720089,
+        "max": 2708321
+      },
+      "formats": {
+        "jpeg": 1797
+      },
+      "modes": {
+        "RGB": 1797
+      }
+    },
+    "2": {
+      "total": 150,
+      "valid": 150,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 224,
+        "median": 224.0,
+        "mean": 949.4666666666667,
+        "p10": 224.0,
+        "p90": 3024.0,
+        "max": 4032
+      },
+      "height": {
+        "min": 224,
+        "median": 224.0,
+        "mean": 1151.4133333333334,
+        "p10": 224.0,
+        "p90": 3623.3999999999974,
+        "max": 4032
+      },
+      "pixels": {
+        "min": 50176,
+        "median": 50176.0,
+        "mean": 2543970.76,
+        "max": 12192768
+      },
+      "file_size": {
+        "min": 6429,
+        "median": 29376.5,
+        "mean": 576705.8,
+        "max": 3289522
+      },
+      "formats": {
+        "jpeg": 150
+      },
+      "modes": {
+        "RGB": 150
+      }
+    },
+    "3": {
+      "total": 1156,
+      "valid": 1156,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 2,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 180,
+        "median": 256.0,
+        "mean": 343.90397923875435,
+        "p10": 256.0,
+        "p90": 435.5,
+        "max": 4608
+      },
+      "height": {
+        "min": 195,
+        "median": 256.0,
+        "mean": 336.77595155709344,
+        "p10": 256.0,
+        "p90": 364.5,
+        "max": 5184
+      },
+      "pixels": {
+        "min": 50000,
+        "median": 65536.0,
+        "mean": 234022.7828719723,
+        "max": 17915904
+      },
+      "file_size": {
+        "min": 7266,
+        "median": 27337.5,
+        "mean": 73333.01470588235,
+        "max": 3711744
+      },
+      "formats": {
+        "jpeg": 1156
+      },
+      "modes": {
+        "RGB": 1156
+      }
+    },
+    "4": {
+      "total": 285,
+      "valid": 285,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 960,
+        "mean": 1564.4771929824562,
+        "p10": 914.4,
+        "p90": 4896.0,
+        "max": 6000
+      },
+      "height": {
+        "min": 256,
+        "median": 1280,
+        "mean": 1620.0947368421052,
+        "p10": 1280.0,
+        "p90": 3672.0,
+        "max": 4000
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 1228800,
+        "mean": 3739803.898245614,
+        "max": 24000000
+      },
+      "file_size": {
+        "min": 8720,
+        "median": 189788,
+        "mean": 438158.95087719295,
+        "max": 3576631
+      },
+      "formats": {
+        "jpeg": 285
+      },
+      "modes": {
+        "RGB": 285
+      }
+    },
+    "5": {
+      "total": 60,
+      "valid": 60,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 1500.0,
+        "mean": 1451.6,
+        "p10": 256.0,
+        "p90": 2000.0,
+        "max": 4000
+      },
+      "height": {
+        "min": 256,
+        "median": 2000.0,
+        "mean": 1637.2666666666667,
+        "p10": 256.0,
+        "p90": 2030.4000000000005,
+        "max": 3000
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 3000000.0,
+        "mean": 2744833.066666667,
+        "max": 12000000
+      },
+      "file_size": {
+        "min": 10635,
+        "median": 438354.0,
+        "mean": 438907.26666666666,
+        "max": 1750034
+      },
+      "formats": {
+        "jpeg": 60
+      },
+      "modes": {
+        "RGB": 60
+      }
+    },
+    "6": {
+      "total": 936,
+      "valid": 936,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 1,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 200,
+        "median": 256.0,
+        "mean": 487.23824786324786,
+        "p10": 224.0,
+        "p90": 1081.0,
+        "max": 5184
+      },
+      "height": {
+        "min": 191,
+        "median": 256.0,
+        "mean": 529.8878205128206,
+        "p10": 224.0,
+        "p90": 1611.5,
+        "max": 4032
+      },
+      "pixels": {
+        "min": 47190,
+        "median": 65536.0,
+        "mean": 817349.217948718,
+        "max": 17915904
+      },
+      "file_size": {
+        "min": 6884,
+        "median": 30154.0,
+        "mean": 196324.90384615384,
+        "max": 4135782
+      },
+      "formats": {
+        "jpeg": 936
+      },
+      "modes": {
+        "RGB": 936
+      }
+    },
+    "7": {
+      "total": 500,
+      "valid": 500,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 1536.0,
+        "mean": 1664.96,
+        "p10": 1525.0,
+        "p90": 2048.0,
+        "max": 2372
+      },
+      "height": {
+        "min": 256,
+        "median": 2035.0,
+        "mean": 1793.948,
+        "p10": 1536.0,
+        "p90": 2048.0,
+        "max": 2601
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 3145728.0,
+        "mean": 2989703.186,
+        "max": 3170064
+      },
+      "file_size": {
+        "min": 10291,
+        "median": 940413.0,
+        "mean": 921360.026,
+        "max": 1278674
+      },
+      "formats": {
+        "jpeg": 500
+      },
+      "modes": {
+        "RGB": 500
+      }
+    },
+    "8": {
+      "total": 1824,
+      "valid": 1824,
+      "corrupt": 0,
+      "small": 1,
+      "extreme_aspect": 3,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 185,
+        "median": 256.0,
+        "mean": 439.3810307017544,
+        "p10": 224.0,
+        "p90": 792.2000000000012,
+        "max": 4032
+      },
+      "height": {
+        "min": 116,
+        "median": 256.0,
+        "mean": 482.98574561403507,
+        "p10": 224.0,
+        "p90": 692.5000000000011,
+        "max": 4272
+      },
+      "pixels": {
+        "min": 33872,
+        "median": 65536.0,
+        "mean": 632944.7905701754,
+        "max": 12192768
+      },
+      "file_size": {
+        "min": 5946,
+        "median": 28139.0,
+        "mean": 206592.2308114035,
+        "max": 5253168
+      },
+      "formats": {
+        "jpeg": 1824
+      },
+      "modes": {
+        "RGB": 1824
+      }
+    },
+    "9": {
+      "total": 1897,
+      "valid": 1897,
+      "corrupt": 0,
+      "small": 0,
+      "extreme_aspect": 0,
+      "grayscale": 0,
+      "alpha": 0,
+      "tiny_files": 0,
+      "large_files": 0,
+      "width": {
+        "min": 256,
+        "median": 256,
+        "mean": 256,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 256
+      },
+      "height": {
+        "min": 256,
+        "median": 256,
+        "mean": 256,
+        "p10": 256.0,
+        "p90": 256.0,
+        "max": 256
+      },
+      "pixels": {
+        "min": 65536,
+        "median": 65536,
+        "mean": 65536,
+        "max": 65536
+      },
+      "file_size": {
+        "min": 5284,
+        "median": 34085,
+        "mean": 33088.12229836584,
+        "max": 52222
+      },
+      "formats": {
+        "jpeg": 1897
+      },
+      "modes": {
+        "RGB": 1897
+      }
+    }
+  },
+  "duplicates": {
+    "unique_hashes": 20390,
+    "duplicate_groups": 0,
+    "duplicate_files": 0,
+    "cross_class_groups": 0,
+    "within_class_groups": 0,
+    "cross_class_examples": []
+  },
+  "health_score": 90,
+  "recommendations": [],
+  "duplicate_removal": {
+    "within_class_removed": 0,
+    "cross_class_removed": 0,
+    "removed_paths": []
+  },
+  "configuration": {
+    "min_width": 128,
+    "min_height": 128,
+    "min_pixels": 16384,
+    "min_aspect_ratio": 0.35,
+    "max_aspect_ratio": 2.85,
+    "large_file_mb": 10,
+    "tiny_file_kb": 5
+  }
+}

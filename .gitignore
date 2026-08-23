@@ -1,0 +1,16 @@
+.venv/
+
+__pycache__/
+*.pyc
+
+_dataset_downloads/
+
+dataset/*
+!dataset/label.txt
+
+real_world/images/
+real_world/results/
+
+models/*.pth
+
+*.log

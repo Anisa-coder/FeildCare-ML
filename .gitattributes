@@ -1,0 +1,2 @@
+archives/dataset-archive/*.zip filter=lfs diff=lfs merge=lfs -text
+archives/real_world-archive/*.zip filter=lfs diff=lfs merge=lfs -text
