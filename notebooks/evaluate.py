@@ -263,9 +263,10 @@ def create_model():
     )
 
     checkpoint = torch.load(
-        MODEL_FILE,
-        map_location=DEVICE
-    )
+    MODEL_FILE,
+    map_location=DEVICE,
+    weights_only=False,
+)
 
     if (
         isinstance(

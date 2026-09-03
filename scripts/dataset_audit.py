@@ -1,54 +1,50 @@
 from __future__ import annotations
 
-
-from collections import Counter, defaultdict
-from pathlib import Path
-from statistics import mean, median
+import argparse
 import hashlib
+import io
 import json
 import math
 import os
+import shutil
 import sys
+from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
+from itertools import combinations
+from pathlib import Path
+from statistics import mean, median
 
 try:
-    from PIL import Image, ImageStat
+    from PIL import Image
 except ImportError:
     print("ERROR: Pillow is required.")
     print("Install with: pip install pillow")
     raise
 
+try:
+    RESAMPLE = Image.Resampling.LANCZOS
+except AttributeError:  # Pillow < 9.1
+    RESAMPLE = Image.LANCZOS
+
 
 # ============================================================================
-# PATHS
+# PATHS  (unchanged — do not move these)
 # ============================================================================
 
 ROOT = Path(__file__).resolve().parent.parent
 DATASET = ROOT / "dataset"
 
-REPORT_DIR = ROOT / "_dataset_reports"
+LOGS_ROOT = ROOT / "logs"
+REPORT_DIR = LOGS_ROOT / "_dataset_reports"
 REPORT_JSON = REPORT_DIR / "dataset_audit.json"
 
+# New in v3: a small, training-script-ready config dropped next to the
+# full audit. Your train.py can load this directly instead of
+# hard-coding input size / normalization / class weights.
+TRAINING_CONFIG_JSON = REPORT_DIR / "effnet_b3_training_config.json"
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".bmp",
-    ".webp",
-    ".tif",
-    ".tiff",
-}
-
-# label.txt is the single source of truth for class IDs and names.
-# Expected format:
-#   1 Healthy Corn
-#   2 Corn Eyespot
-#   3 Corn Northern Leaf Blight
-
+DEFAULT_LOG_DIR = LOGS_ROOT / "dataset_audit"
 
 LABEL_FILE = DATASET / "label.txt"
 
@@ -56,15 +52,12 @@ LABEL_FILE = DATASET / "label.txt"
 def load_labels() -> dict[int, str]:
     """Load class IDs and names directly from dataset/label.txt."""
     if not LABEL_FILE.exists():
-        raise FileNotFoundError(
-            f"label.txt not found: {LABEL_FILE}"
-        )
+        raise FileNotFoundError(f"label.txt not found: {LABEL_FILE}")
 
     labels: dict[int, str] = {}
 
     for line_number, raw_line in enumerate(
-        LABEL_FILE.read_text(encoding="utf-8").splitlines(),
-        start=1,
+        LABEL_FILE.read_text(encoding="utf-8").splitlines(), start=1
     ):
         line = raw_line.strip()
 
@@ -83,14 +76,10 @@ def load_labels() -> dict[int, str]:
         class_name = parts[1].strip()
 
         if class_id <= 0:
-            raise ValueError(
-                f"Invalid class ID {class_id} on line {line_number}."
-            )
+            raise ValueError(f"Invalid class ID {class_id} on line {line_number}.")
 
         if class_id in labels:
-            raise ValueError(
-                f"Duplicate class ID {class_id} in label.txt."
-            )
+            raise ValueError(f"Duplicate class ID {class_id} in label.txt.")
 
         labels[class_id] = class_name
 
@@ -103,32 +92,64 @@ def load_labels() -> dict[int, str]:
 LABELS = load_labels()
 
 
-# Class targets are intentionally not hard-coded.\n# Class definitions come exclusively from label.txt.\n
+# ============================================================================
+# EFFICIENTNET-B3 MODEL CONFIG
+# ============================================================================
+# Source: Tan & Le, "EfficientNet: Rethinking Model Scaling for CNNs" (2019).
+# B3 is compound-scaled to a native 300x300 input; params ~12M; ImageNet
+# top-1 ~81.6%. These numbers don't change — they're fixed by the published
+# architecture, not by which framework/library you load it from.
 
-# Quality thresholds.
-#
-# These are warnings, NOT automatic deletions.
-MIN_WIDTH = 128
-MIN_HEIGHT = 128
+MODEL_NAME = "EfficientNet-B3"
+EFFNET_INPUT_SIZE = 300          # native training resolution
+EFFNET_RESIZE_SIZE = 320         # common "resize-then-crop" convention (resize
+                                  # shorter side to this, then crop to 300x300)
+EFFNET_PARAMS_MILLIONS = 12
+EFFNET_IMAGENET_TOP1 = 81.6
 
-# Images below this area are flagged as small.
-MIN_PIXELS = 128 * 128
+# Standard ImageNet normalization — correct for torchvision.models and timm
+# pretrained weights. NOTE: if you're using tf.keras.applications.EfficientNetB3,
+# its preprocess_input is a pass-through (rescaling is baked into the model as
+# a Rescaling layer) — don't apply these stats on top of that, or you'll
+# double-normalize. Check whichever library you actually train with.
+EFFNET_NORM_MEAN = (0.485, 0.456, 0.406)
+EFFNET_NORM_STD = (0.229, 0.224, 0.225)
 
-# Aspect ratios outside this range are flagged.
+# Resolution tiers, all relative to EFFNET_INPUT_SIZE.
+MIN_ACCEPTABLE_SIZE = EFFNET_INPUT_SIZE          # 300 — below this, every
+                                                  # image needs upscaling
+IDEAL_SOURCE_SIZE = int(EFFNET_INPUT_SIZE * 1.5)  # 450 — comfortable margin
+                                                   # for RandomResizedCrop
+                                                   # augmentation without
+                                                   # magnifying artifacts
+SEVERELY_UNDERSIZED = EFFNET_INPUT_SIZE // 2      # 150 — needs >2x upscale,
+                                                   # flag for manual review
+MIN_PIXELS = MIN_ACCEPTABLE_SIZE * MIN_ACCEPTABLE_SIZE
+
+# Aspect ratios outside this range lose significant content on a
+# center/random square crop and are flagged (model-agnostic).
 MIN_ASPECT_RATIO = 0.35
 MAX_ASPECT_RATIO = 2.85
 
-# Extremely large files may indicate uncompressed/raw data.
-LARGE_FILE_MB = 10
+# Per-class sample-size rules of thumb for fine-tuning a pretrained B3.
+MIN_RECOMMENDED_PER_CLASS = 150   # below this, expect high variance / risk
+                                   # of overfitting that class
+IDEAL_PER_CLASS = 400             # comfortable for fine-tuning without
+                                   # heavy augmentation reliance
 
-# Very tiny files can be broken/placeholder images.
+# File-level sanity thresholds.
+LARGE_FILE_MB = 10
 TINY_FILE_KB = 5
 
-# Number of examples shown per issue.
-MAX_EXAMPLES = 15
+# Perceptual (visual) duplicate detection.
+PHASH_SIZE = 8                     # -> 64-bit dHash
+NEAR_DUP_HAMMING_THRESHOLD = 5      # <=5 bits different = "looks the same"
+NEAR_DUP_MAX_CLASS_SIZE = 2500       # skip pairwise near-dup scan for a class
+                                      # larger than this (cost is O(n^2));
+                                      # exact-dHash matching still runs for it
 
-# Show every class even if it does not currently exist.
-SHOW_EMPTY_CLASSES = True
+MAX_EXAMPLES = 15
+EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
 # ============================================================================
@@ -136,10 +157,7 @@ SHOW_EMPTY_CLASSES = True
 # ============================================================================
 
 def label_for(class_id: int) -> str:
-    return LABELS.get(
-        class_id,
-        f"Unknown Class {class_id}",
-    )
+    return LABELS.get(class_id, f"Unknown Class {class_id}")
 
 
 def pct(value: float, total: float) -> str:
@@ -148,7 +166,7 @@ def pct(value: float, total: float) -> str:
     return f"{(value / total) * 100:.2f}%"
 
 
-def ratio_text(a: int, b: int) -> str:
+def ratio_text(a: float, b: float) -> str:
     if b <= 0:
         return "N/A"
     return f"{a / b:.2f}:1"
@@ -176,10 +194,7 @@ def safe_relative(path: Path) -> str:
 
 
 def is_image(path: Path) -> bool:
-    return (
-        path.is_file()
-        and path.suffix.lower() in EXTENSIONS
-    )
+    return path.is_file() and path.suffix.lower() in EXTENSIONS
 
 
 def iter_class_images():
@@ -187,60 +202,23 @@ def iter_class_images():
         return
 
     for folder in DATASET.iterdir():
-
-        if not folder.is_dir():
-            continue
-
-        if not folder.name.isdigit():
+        if not folder.is_dir() or not folder.name.isdigit():
             continue
 
         class_id = int(folder.name)
 
         for image in folder.rglob("*"):
-
             if is_image(image):
                 yield class_id, image
 
 
-def sha256_file(path: Path) -> str | None:
-    try:
-
-        digest = hashlib.sha256()
-
-        with path.open("rb") as file:
-
-            while True:
-
-                chunk = file.read(1024 * 1024)
-
-                if not chunk:
-                    break
-
-                digest.update(chunk)
-
-        return digest.hexdigest()
-
-    except Exception:
-        return None
-
-
-def human_size(size_bytes: int) -> str:
-
-    units = (
-        "B",
-        "KB",
-        "MB",
-        "GB",
-        "TB",
-    )
-
+def human_size(size_bytes: float) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
     size = float(size_bytes)
 
     for unit in units:
-
         if size < 1024 or unit == units[-1]:
             return f"{size:.2f} {unit}"
-
         size /= 1024
 
     return f"{size_bytes} B"
@@ -271,11 +249,32 @@ def percentile(values, p: float):
         return ordered[lower]
 
     fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
-    return (
-        ordered[lower]
-        + (ordered[upper] - ordered[lower]) * fraction
-    )
+
+def hamming_distance(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
+def compute_dhash(image: Image.Image, hash_size: int = PHASH_SIZE) -> int:
+    """64-bit difference hash. Robust to resizing/recompression, which is
+    exactly the kind of near-duplicate a byte-exact SHA-256 check misses
+    (e.g. the same leaf photo pulled from two different aggregated
+    datasets at different JPEG quality levels)."""
+    small = image.convert("L").resize((hash_size + 1, hash_size), RESAMPLE)
+    # .tobytes() on an "L" image gives one byte (0-255) per pixel, row-major —
+    # equivalent to getdata() here but without the Pillow 14 deprecation and
+    # without depending on a Pillow version new enough to have get_flattened_data.
+    pixels = list(small.tobytes())
+
+    bits = 0
+    for row in range(hash_size):
+        offset = row * (hash_size + 1)
+        row_pixels = pixels[offset : offset + hash_size + 1]
+        for col in range(hash_size):
+            bits = (bits << 1) | (1 if row_pixels[col] > row_pixels[col + 1] else 0)
+
+    return bits
 
 
 # ============================================================================
@@ -283,7 +282,6 @@ def percentile(values, p: float):
 # ============================================================================
 
 def collect_files():
-
     class_files = defaultdict(list)
 
     for class_id, path in iter_class_images():
@@ -295,9 +293,14 @@ def collect_files():
     return dict(class_files)
 
 
-def inspect_image(
-    path: Path,
-) -> dict:
+def inspect_image(path: Path) -> dict:
+    """Single-pass image inspection.
+
+    v2 opened every file up to 4 times (stat, full read for sha256,
+    Image.open+verify, Image.open+decode). This reads the file once,
+    hashes the in-memory bytes, and reuses the same bytes for both the
+    PIL verify pass and the real decode — no repeat disk I/O.
+    """
 
     result = {
         "path": str(path),
@@ -312,8 +315,11 @@ def inspect_image(
         "channels": None,
         "file_size": 0,
         "sha256": None,
+        "dhash": None,
         "error": None,
-        "small": False,
+        "small": False,               # below EFFNET_INPUT_SIZE (300x300)
+        "below_ideal_resolution": False,  # below IDEAL_SOURCE_SIZE (450x450)
+        "severely_undersized": False,     # below SEVERELY_UNDERSIZED (150x150)
         "extreme_aspect": False,
         "tiny_file": False,
         "large_file": False,
@@ -322,91 +328,63 @@ def inspect_image(
     }
 
     try:
+        data = path.read_bytes()
 
-        result["file_size"] = path.stat().st_size
+        result["file_size"] = len(data)
+        result["tiny_file"] = len(data) < TINY_FILE_KB * 1024
+        result["large_file"] = len(data) > LARGE_FILE_MB * 1024 * 1024
+        result["sha256"] = hashlib.sha256(data).hexdigest()
 
-        result["tiny_file"] = (
-            result["file_size"]
-            < TINY_FILE_KB * 1024
-        )
+        # verify() checks the encoded stream without fully decoding pixels;
+        # it invalidates the file object afterwards so we reopen from the
+        # same in-memory bytes (no extra disk read either way).
+        with Image.open(io.BytesIO(data)) as probe:
+            probe.verify()
 
-        result["large_file"] = (
-            result["file_size"]
-            > LARGE_FILE_MB * 1024 * 1024
-        )
-
-        result["sha256"] = sha256_file(path)
-
-        with Image.open(path) as image:
-
-            # verify() checks the encoded file without decoding all pixels.
-            image.verify()
-
-        # Reopen after verify().
-        with Image.open(path) as image:
-
+        with Image.open(io.BytesIO(data)) as image:
             width, height = image.size
 
             result["width"] = width
             result["height"] = height
             result["pixels"] = width * height
-            result["aspect_ratio"] = (
-                width / height
-                if height
-                else None
-            )
-            result["format"] = (
-                image.format or path.suffix.lstrip(".")
-            ).lower()
+            result["aspect_ratio"] = width / height if height else None
+            result["format"] = (image.format or path.suffix.lstrip(".")).lower()
             result["mode"] = image.mode
 
             channels = {
-                "1": 1,
-                "L": 1,
-                "LA": 2,
-                "P": 1,
-                "RGB": 3,
-                "RGBA": 4,
-                "CMYK": 4,
-                "YCbCr": 3,
-                "I": 1,
-                "F": 1,
+                "1": 1, "L": 1, "LA": 2, "P": 1, "RGB": 3,
+                "RGBA": 4, "CMYK": 4, "YCbCr": 3, "I": 1, "F": 1,
             }.get(image.mode)
-
             result["channels"] = channels
 
-            result["grayscale"] = image.mode in {
-                "1",
-                "L",
-                "LA",
-            }
-
+            result["grayscale"] = image.mode in {"1", "L", "LA"}
             result["has_alpha"] = (
                 "A" in image.mode
-                or image.mode == "P"
-                and "transparency" in image.info
+                or (image.mode == "P" and "transparency" in image.info)
             )
 
+            result["dhash"] = compute_dhash(image)
+
         result["small"] = (
-            result["width"] < MIN_WIDTH
-            or result["height"] < MIN_HEIGHT
+            width < MIN_ACCEPTABLE_SIZE
+            or height < MIN_ACCEPTABLE_SIZE
             or result["pixels"] < MIN_PIXELS
+        )
+        result["below_ideal_resolution"] = (
+            width < IDEAL_SOURCE_SIZE or height < IDEAL_SOURCE_SIZE
+        )
+        result["severely_undersized"] = (
+            width < SEVERELY_UNDERSIZED or height < SEVERELY_UNDERSIZED
         )
 
         ratio = result["aspect_ratio"]
-
-        result["extreme_aspect"] = (
-            ratio is not None
-            and (
-                ratio < MIN_ASPECT_RATIO
-                or ratio > MAX_ASPECT_RATIO
-            )
+        result["extreme_aspect"] = ratio is not None and (
+            ratio < MIN_ASPECT_RATIO or ratio > MAX_ASPECT_RATIO
         )
 
         result["valid"] = True
 
     except Exception as error:
-
         result["error"] = str(error)
 
     return result
@@ -416,34 +394,15 @@ def inspect_image(
 # DISTRIBUTION
 # ============================================================================
 
-def audit_distribution(
-    class_files: dict,
-) -> dict:
+def audit_distribution(class_files: dict) -> dict:
+    counts = {class_id: len(class_files.get(class_id, [])) for class_id in LABELS}
 
-    counts = {}
-
-    for class_id in LABELS:
-
-        counts[class_id] = len(
-            class_files.get(class_id, [])
-        )
-
-    # Include unexpected numeric class folders.
     for class_id in class_files:
-
         if class_id not in counts:
-            counts[class_id] = len(
-                class_files[class_id]
-            )
+            counts[class_id] = len(class_files[class_id])
 
-    present = [
-        count
-        for count in counts.values()
-        if count > 0
-    ]
-
+    present = [count for count in counts.values() if count > 0]
     total = sum(counts.values())
-
     minimum = min(present) if present else 0
     maximum = max(present) if present else 0
 
@@ -452,117 +411,69 @@ def audit_distribution(
         "total": total,
         "minimum": minimum,
         "maximum": maximum,
-        "ratio": (
-            maximum / minimum
-            if minimum
-            else None
-        ),
+        "ratio": (maximum / minimum) if minimum else None,
     }
 
 
 # ============================================================================
-# IMAGE QUALITY
+# IMAGE QUALITY (parallelized)
 # ============================================================================
 
-def audit_image_quality(
-    class_files: dict,
-) -> tuple[dict, list[dict]]:
+def audit_image_quality(class_files: dict, workers: int) -> tuple[dict, list[dict]]:
+    all_items = [
+        (class_id, path)
+        for class_id, images in class_files.items()
+        for path in images
+    ]
+
+    print_subsection("IMAGE VALIDATION / QUALITY SCAN")
+    print(f"Images to inspect : {len(all_items):,}")
+    print(f"Worker processes  : {workers}")
+
+    records: list[dict] = []
+
+    if not all_items:
+        return {}, records
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(inspect_image, path): class_id
+            for class_id, path in all_items
+        }
+
+        completed = 0
+        for future in as_completed(futures):
+            record = future.result()
+            record["class_id"] = futures[future]
+            records.append(record)
+
+            completed += 1
+            if completed % 1000 == 0 or completed == len(futures):
+                print(f"  Processed {completed:,}/{len(futures):,} images...")
 
     stats_by_class = {}
-    records = []
-
-    all_paths = []
-
-    for class_id, images in class_files.items():
-
-        for path in images:
-            all_paths.append(
-                (class_id, path)
-            )
-
-    print_subsection(
-        "IMAGE VALIDATION / QUALITY SCAN"
-    )
-
-    print(
-        f"Images to inspect: {len(all_paths):,}"
-    )
-
-    for class_id, path in all_paths:
-
-        record = inspect_image(path)
-        record["class_id"] = class_id
-
-        records.append(record)
 
     for class_id in class_files:
+        class_records = [r for r in records if r["class_id"] == class_id]
+        valid = [r for r in class_records if r["valid"]]
 
-        class_records = [
-            record
-            for record in records
-            if record["class_id"] == class_id
-        ]
-
-        valid = [
-            record
-            for record in class_records
-            if record["valid"]
-        ]
-
-        widths = [
-            record["width"]
-            for record in valid
-            if record["width"] is not None
-        ]
-
-        heights = [
-            record["height"]
-            for record in valid
-            if record["height"] is not None
-        ]
-
-        pixels = [
-            record["pixels"]
-            for record in valid
-            if record["pixels"] is not None
-        ]
-
-        file_sizes = [
-            record["file_size"]
-            for record in valid
-        ]
+        widths = [r["width"] for r in valid if r["width"] is not None]
+        heights = [r["height"] for r in valid if r["height"] is not None]
+        pixels = [r["pixels"] for r in valid if r["pixels"] is not None]
+        file_sizes = [r["file_size"] for r in valid]
 
         stats_by_class[class_id] = {
             "total": len(class_records),
             "valid": len(valid),
-            "corrupt": sum(
-                not record["valid"]
-                for record in class_records
-            ),
-            "small": sum(
-                record["small"]
-                for record in valid
-            ),
-            "extreme_aspect": sum(
-                record["extreme_aspect"]
-                for record in valid
-            ),
-            "grayscale": sum(
-                record["grayscale"]
-                for record in valid
-            ),
-            "alpha": sum(
-                record["has_alpha"]
-                for record in valid
-            ),
-            "tiny_files": sum(
-                record["tiny_file"]
-                for record in valid
-            ),
-            "large_files": sum(
-                record["large_file"]
-                for record in valid
-            ),
+            "corrupt": sum(not r["valid"] for r in class_records),
+            "small": sum(r["small"] for r in valid),
+            "below_ideal_resolution": sum(r["below_ideal_resolution"] for r in valid),
+            "severely_undersized": sum(r["severely_undersized"] for r in valid),
+            "extreme_aspect": sum(r["extreme_aspect"] for r in valid),
+            "grayscale": sum(r["grayscale"] for r in valid),
+            "alpha": sum(r["has_alpha"] for r in valid),
+            "tiny_files": sum(r["tiny_file"] for r in valid),
+            "large_files": sum(r["large_file"] for r in valid),
             "width": {
                 "min": min(widths) if widths else 0,
                 "median": safe_median(widths),
@@ -591,243 +502,198 @@ def audit_image_quality(
                 "mean": safe_mean(file_sizes),
                 "max": max(file_sizes) if file_sizes else 0,
             },
-            "formats": dict(
-                Counter(
-                    record["format"]
-                    for record in valid
-                )
-            ),
-            "modes": dict(
-                Counter(
-                    record["mode"]
-                    for record in valid
-                )
-            ),
+            "formats": dict(Counter(r["format"] for r in valid)),
+            "modes": dict(Counter(r["mode"] for r in valid)),
         }
 
     return stats_by_class, records
 
 
 # ============================================================================
-# DUPLICATES
+# DUPLICATES  (exact SHA-256 + perceptual dHash, both O(n))
 # ============================================================================
 
-def audit_duplicates(
-    records: list[dict],
-) -> dict:
+def audit_duplicates(records: list[dict]) -> dict:
+    print_subsection("DUPLICATE ANALYSIS (exact + visual)")
 
-    print_subsection(
-        "EXACT DUPLICATE ANALYSIS"
-    )
+    valid_records = [r for r in records if r["valid"]]
 
+    # ---- Exact byte-for-byte duplicates -----------------------------------
     hash_map = defaultdict(list)
-
-    for record in records:
-
+    for record in valid_records:
         digest = record.get("sha256")
-
         if digest:
             hash_map[digest].append(record)
 
-    duplicate_groups = {
-        digest: items
-        for digest, items in hash_map.items()
-        if len(items) > 1
+    exact_groups = {d: items for d, items in hash_map.items() if len(items) > 1}
+    exact_cross_class = [
+        (d, items)
+        for d, items in exact_groups.items()
+        if len({item["class_id"] for item in items}) > 1
+    ]
+    exact_within_class = [
+        (d, items)
+        for d, items in exact_groups.items()
+        if len({item["class_id"] for item in items}) == 1
+    ]
+    exact_duplicate_files = sum(len(items) - 1 for items in exact_groups.values())
+
+    # ---- Visual (perceptual) duplicates — exact dHash match, O(n) ---------
+    dhash_map = defaultdict(list)
+    for record in valid_records:
+        digest = record.get("dhash")
+        if digest is not None:
+            dhash_map[digest].append(record)
+
+    visual_groups = {d: items for d, items in dhash_map.items() if len(items) > 1}
+    visual_cross_class = [
+        (d, items)
+        for d, items in visual_groups.items()
+        if len({item["class_id"] for item in items}) > 1
+    ]
+    visual_within_class = [
+        (d, items)
+        for d, items in visual_groups.items()
+        if len({item["class_id"] for item in items}) == 1
+    ]
+    visual_duplicate_files = sum(len(items) - 1 for items in visual_groups.values())
+
+    # ---- Near-duplicates (Hamming distance <= threshold), bounded per class
+    # Exact-dHash grouping above is O(n). Fuzzy matching is O(n^2) per class,
+    # so it's only run within each class (not across the whole dataset) and
+    # skipped for any class larger than NEAR_DUP_MAX_CLASS_SIZE.
+    already_grouped = {
+        id(item) for items in visual_groups.values() for item in items
     }
 
-    duplicate_files = sum(
-        len(items) - 1
-        for items in duplicate_groups.values()
-    )
+    by_class = defaultdict(list)
+    for record in valid_records:
+        if id(record) not in already_grouped and record.get("dhash") is not None:
+            by_class[record["class_id"]].append(record)
 
-    cross_class_groups = []
-    same_class_groups = []
+    near_dup_pairs = []
+    skipped_classes = []
 
-    for digest, items in duplicate_groups.items():
+    for class_id, items in by_class.items():
+        if len(items) > NEAR_DUP_MAX_CLASS_SIZE:
+            skipped_classes.append(class_id)
+            continue
 
-        class_ids = {
-            item["class_id"]
-            for item in items
-        }
+        for a, b in combinations(items, 2):
+            distance = hamming_distance(a["dhash"], b["dhash"])
+            if distance <= NEAR_DUP_HAMMING_THRESHOLD:
+                near_dup_pairs.append((class_id, a, b, distance))
 
-        if len(class_ids) > 1:
-            cross_class_groups.append(
-                (digest, items)
-            )
-        else:
-            same_class_groups.append(
-                (digest, items)
-            )
+    print(f"Exact duplicate groups    : {len(exact_groups):,} "
+          f"({exact_duplicate_files:,} redundant files)")
+    print(f"  Cross-class             : {len(exact_cross_class):,}")
+    print(f"  Within-class            : {len(exact_within_class):,}")
+    print(f"Visual duplicate groups   : {len(visual_groups):,} "
+          f"({visual_duplicate_files:,} redundant files)")
+    print(f"  Cross-class             : {len(visual_cross_class):,}")
+    print(f"  Within-class            : {len(visual_within_class):,}")
+    print(f"Near-duplicate pairs      : {len(near_dup_pairs):,} "
+          f"(Hamming <= {NEAR_DUP_HAMMING_THRESHOLD}, within-class only)")
 
-    print(
-        f"Unique hashes          : {len(hash_map):,}"
-    )
+    if skipped_classes:
+        print(f"  Skipped near-dup scan for {len(skipped_classes)} class(es) "
+              f"over {NEAR_DUP_MAX_CLASS_SIZE:,} images (exact-dHash still ran)")
 
-    print(
-        f"Duplicate groups       : "
-        f"{len(duplicate_groups):,}"
-    )
-
-    print(
-        f"Duplicate files        : "
-        f"{duplicate_files:,}"
-    )
-
-    print(
-        f"Cross-class groups     : "
-        f"{len(cross_class_groups):,}"
-    )
-
-    print(
-        f"Within-class groups    : "
-        f"{len(same_class_groups):,}"
-    )
-
-    if cross_class_groups:
-
+    if exact_cross_class or visual_cross_class:
         print()
-        print(
-            "WARNING: Cross-class exact duplicates detected."
-        )
-
-        print(
-            "These are especially important because the same "
-            "image exists under different labels."
-        )
+        print("WARNING: cross-class duplicates found — the same image exists")
+        print("under two different labels. This is a labeling-correctness bug,")
+        print("not just wasted disk space, and should be fixed before training.")
 
     return {
-        "unique_hashes": len(hash_map),
-        "duplicate_groups": len(duplicate_groups),
-        "duplicate_files": duplicate_files,
-        "cross_class_groups": len(cross_class_groups),
-        "within_class_groups": len(same_class_groups),
-        "groups": duplicate_groups,
-        "cross_class_examples": [
-            {
-                "sha256": digest,
-                "files": [
-                    {
-                        "class_id": item["class_id"],
-                        "path": item["relative_path"],
-                    }
-                    for item in items
-                ],
-            }
-            for digest, items in cross_class_groups[:MAX_EXAMPLES]
-        ],
+        "exact": {
+            "unique_hashes": len(hash_map),
+            "duplicate_groups": len(exact_groups),
+            "duplicate_files": exact_duplicate_files,
+            "cross_class_groups": len(exact_cross_class),
+            "within_class_groups": len(exact_within_class),
+            "groups": exact_groups,
+            "cross_class_examples": [
+                {
+                    "sha256": digest,
+                    "files": [
+                        {"class_id": i["class_id"], "path": i["relative_path"]}
+                        for i in items
+                    ],
+                }
+                for digest, items in exact_cross_class[:MAX_EXAMPLES]
+            ],
+        },
+        "visual": {
+            "unique_hashes": len(dhash_map),
+            "duplicate_groups": len(visual_groups),
+            "duplicate_files": visual_duplicate_files,
+            "cross_class_groups": len(visual_cross_class),
+            "within_class_groups": len(visual_within_class),
+            "groups": visual_groups,
+            "cross_class_examples": [
+                {
+                    "dhash": f"{digest:016x}",
+                    "files": [
+                        {"class_id": i["class_id"], "path": i["relative_path"]}
+                        for i in items
+                    ],
+                }
+                for digest, items in visual_cross_class[:MAX_EXAMPLES]
+            ],
+        },
+        "near_duplicates": {
+            "pair_count": len(near_dup_pairs),
+            "skipped_classes": skipped_classes,
+            "examples": [
+                {
+                    "class_id": class_id,
+                    "class_name": label_for(class_id),
+                    "hamming_distance": distance,
+                    "file_a": a["relative_path"],
+                    "file_b": b["relative_path"],
+                }
+                for class_id, a, b, distance in near_dup_pairs[:MAX_EXAMPLES]
+            ],
+        },
     }
 
 
 # ============================================================================
-# FORMAT / QUALITY GLOBAL ANALYSIS
+# GLOBAL QUALITY SUMMARY
 # ============================================================================
 
-def global_quality_summary(
-    records: list[dict],
-) -> dict:
-
-    valid = [
-        record
-        for record in records
-        if record["valid"]
-    ]
-
-    corrupt = [
-        record
-        for record in records
-        if not record["valid"]
-    ]
+def global_quality_summary(records: list[dict]) -> dict:
+    valid = [r for r in records if r["valid"]]
+    corrupt = [r for r in records if not r["valid"]]
 
     dimensions = [
-        (
-            record["width"],
-            record["height"],
-        )
-        for record in valid
-        if record["width"] and record["height"]
+        (r["width"], r["height"]) for r in valid if r["width"] and r["height"]
     ]
-
-    ratios = [
-        record["aspect_ratio"]
-        for record in valid
-        if record["aspect_ratio"]
-    ]
-
-    sizes = [
-        record["file_size"]
-        for record in valid
-    ]
+    ratios = [r["aspect_ratio"] for r in valid if r["aspect_ratio"]]
+    sizes = [r["file_size"] for r in valid]
 
     return {
         "total_records": len(records),
         "valid": len(valid),
         "corrupt": len(corrupt),
-        "small": sum(
-            record["small"]
-            for record in valid
-        ),
-        "extreme_aspect": sum(
-            record["extreme_aspect"]
-            for record in valid
-        ),
-        "grayscale": sum(
-            record["grayscale"]
-            for record in valid
-        ),
-        "alpha": sum(
-            record["has_alpha"]
-            for record in valid
-        ),
-        "tiny_files": sum(
-            record["tiny_file"]
-            for record in valid
-        ),
-        "large_files": sum(
-            record["large_file"]
-            for record in valid
-        ),
-        "formats": dict(
-            Counter(
-                record["format"]
-                for record in valid
-            )
-        ),
-        "modes": dict(
-            Counter(
-                record["mode"]
-                for record in valid
-            )
-        ),
+        "small": sum(r["small"] for r in valid),
+        "below_ideal_resolution": sum(r["below_ideal_resolution"] for r in valid),
+        "severely_undersized": sum(r["severely_undersized"] for r in valid),
+        "extreme_aspect": sum(r["extreme_aspect"] for r in valid),
+        "grayscale": sum(r["grayscale"] for r in valid),
+        "alpha": sum(r["has_alpha"] for r in valid),
+        "tiny_files": sum(r["tiny_file"] for r in valid),
+        "large_files": sum(r["large_file"] for r in valid),
+        "formats": dict(Counter(r["format"] for r in valid)),
+        "modes": dict(Counter(r["mode"] for r in valid)),
         "dimensions": {
-            "min_width": min(
-                (x[0] for x in dimensions),
-                default=0,
-            ),
-            "median_width": safe_median(
-                [x[0] for x in dimensions]
-            ),
-            "min_height": min(
-                (x[1] for x in dimensions),
-                default=0,
-            ),
-            "median_height": safe_median(
-                [x[1] for x in dimensions]
-            ),
-            "min_pixels": min(
-                (
-                    record["pixels"]
-                    for record in valid
-                    if record["pixels"]
-                ),
-                default=0,
-            ),
-            "median_pixels": safe_median(
-                [
-                    record["pixels"]
-                    for record in valid
-                    if record["pixels"]
-                ]
-            ),
+            "min_width": min((x[0] for x in dimensions), default=0),
+            "median_width": safe_median([x[0] for x in dimensions]),
+            "min_height": min((x[1] for x in dimensions), default=0),
+            "median_height": safe_median([x[1] for x in dimensions]),
+            "min_pixels": min((r["pixels"] for r in valid if r["pixels"]), default=0),
+            "median_pixels": safe_median([r["pixels"] for r in valid if r["pixels"]]),
         },
         "aspect_ratio": {
             "minimum": min(ratios, default=0),
@@ -840,755 +706,419 @@ def global_quality_summary(
             "mean_bytes": safe_mean(sizes),
             "maximum_bytes": max(sizes, default=0),
         },
-        "corrupt_examples": [
-            record["relative_path"]
-            for record in corrupt[:MAX_EXAMPLES]
-        ],
+        "corrupt_examples": [r["relative_path"] for r in corrupt[:MAX_EXAMPLES]],
         "small_examples": [
-            record["relative_path"]
-            for record in valid
-            if record["small"]
+            r["relative_path"] for r in valid if r["small"]
+        ][:MAX_EXAMPLES],
+        "severely_undersized_examples": [
+            r["relative_path"] for r in valid if r["severely_undersized"]
         ][:MAX_EXAMPLES],
         "aspect_examples": [
-            record["relative_path"]
-            for record in valid
-            if record["extreme_aspect"]
+            r["relative_path"] for r in valid if r["extreme_aspect"]
         ][:MAX_EXAMPLES],
         "tiny_file_examples": [
-            record["relative_path"]
-            for record in valid
-            if record["tiny_file"]
+            r["relative_path"] for r in valid if r["tiny_file"]
         ][:MAX_EXAMPLES],
     }
 
 
 # ============================================================================
-# IMBALANCE ANALYSIS
+# IMBALANCE / COMPLETENESS
 # ============================================================================
 
-def imbalance_analysis(
-    counts: dict,
-) -> dict:
-
-    nonzero = {
-        class_id: count
-        for class_id, count in counts.items()
-        if count > 0
-    }
+def imbalance_analysis(counts: dict) -> dict:
+    nonzero = {cid: c for cid, c in counts.items() if c > 0}
 
     if not nonzero:
-
         return {
-            "median": 0,
-            "mean": 0,
-            "max": 0,
-            "min": 0,
-            "max_to_min": None,
-            "classes_below_25pct_median": [],
-            "classes_below_50pct_median": [],
+            "median": 0, "mean": 0, "max": 0, "min": 0, "max_to_min": None,
+            "classes_below_25pct_median": [], "classes_below_50pct_median": [],
             "classes_above_2x_median": [],
         }
 
     values = list(nonzero.values())
-
     med = median(values)
-
-    below_25 = [
-        class_id
-        for class_id, count in nonzero.items()
-        if count < med * 0.25
-    ]
-
-    below_50 = [
-        class_id
-        for class_id, count in nonzero.items()
-        if count < med * 0.50
-    ]
-
-    above_2x = [
-        class_id
-        for class_id, count in nonzero.items()
-        if count > med * 2
-    ]
 
     return {
         "median": med,
         "mean": mean(values),
         "max": max(values),
         "min": min(values),
-        "max_to_min": (
-            max(values) / min(values)
-            if min(values)
-            else None
-        ),
-        "classes_below_25pct_median": below_25,
-        "classes_below_50pct_median": below_50,
-        "classes_above_2x_median": above_2x,
+        "max_to_min": (max(values) / min(values)) if min(values) else None,
+        "classes_below_25pct_median": [c for c, n in nonzero.items() if n < med * 0.25],
+        "classes_below_50pct_median": [c for c, n in nonzero.items() if n < med * 0.50],
+        "classes_above_2x_median": [c for c, n in nonzero.items() if n > med * 2],
     }
 
 
-# ============================================================================
-# DATASET COMPLETENESS
-# ============================================================================
-
-def completeness_analysis(
-    counts: dict,
-) -> dict:
-
+def completeness_analysis(counts: dict) -> dict:
     expected = set(LABELS)
     actual = set(counts)
 
-    missing_folders = sorted(
-        class_id
-        for class_id in expected
-        if counts.get(class_id, 0) == 0
-    )
-
-    unexpected_folders = sorted(
-        class_id
-        for class_id in actual
-        if class_id not in expected
-    )
-
     return {
         "expected_classes": len(expected),
-        "classes_with_images": sum(
-            counts.get(class_id, 0) > 0
-            for class_id in expected
-        ),
-        "empty_classes": missing_folders,
-        "unexpected_numeric_folders": unexpected_folders,
+        "classes_with_images": sum(counts.get(c, 0) > 0 for c in expected),
+        "empty_classes": sorted(c for c in expected if counts.get(c, 0) == 0),
+        "unexpected_numeric_folders": sorted(c for c in actual if c not in expected),
     }
 
 
+def compute_class_weights(counts: dict) -> dict:
+    """sklearn-style 'balanced' weights: n_samples / (n_classes * count).
+    Feed this straight into nn.CrossEntropyLoss(weight=...) (PyTorch) or
+    class_weight=... (Keras/scikit-learn)."""
+    nonzero = {cid: c for cid, c in counts.items() if c > 0}
+    if not nonzero:
+        return {}
+
+    n_samples = sum(nonzero.values())
+    n_classes = len(nonzero)
+
+    return {cid: round(n_samples / (n_classes * count), 4) for cid, count in nonzero.items()}
+
+
 # ============================================================================
-# HEALTH SCORE
+# EFFICIENTNET-B3 TRAINING READINESS
 # ============================================================================
+# Full batch-size / fine-tuning detail lives in the JSON config
+# (TRAINING_CONFIG_JSON) for the training script to consume directly.
+# The console report only prints short, aggregate stats — no per-image
+# detail, no walls of prose.
 
-def calculate_health_score(
-    distribution: dict,
-    quality: dict,
-    duplicates: dict,
-) -> tuple[int, list[str]]:
+BATCH_SIZE_GUIDANCE = [
+    ("~6 GB  (e.g. GTX 1660, RTX 2060)", 8),
+    ("~8 GB  (e.g. RTX 3050/3060 8GB)", 16),
+    ("~12 GB (e.g. RTX 3060 12GB, RTX 4070)", 24),
+    ("~16 GB (e.g. T4, RTX 4060 Ti 16GB)", 32),
+    ("~24 GB (e.g. RTX 3090/4090, A10, A5000)", 48),
+    ("~40 GB+ (e.g. A100)", 64),
+]
 
-    score = 100
-    deductions = []
+FINE_TUNING_NOTES = [
+    "Start from ImageNet-pretrained weights, replace the classifier head "
+    "with num_classes outputs.",
+    "Phase 1: freeze backbone, train head only, LR ~1e-3.",
+    "Phase 2: unfreeze all, fine-tune at LR ~1e-4 to 1e-5, cosine/step schedule.",
+    "Use label smoothing (~0.1) for multi-source aggregated label noise.",
+    "Use mixed precision (AMP).",
+]
 
-    # ------------------------------------------------------------
-    # Corrupt images
-    # ------------------------------------------------------------
+SUGGESTED_SPLIT_SHORT = "70/15/15 or 80/10/10, stratified by class"
 
-    total = max(
-        1,
-        quality["total_records"],
+
+def effnet_readiness_report(
+    quality: dict, distribution: dict, imbalance: dict
+) -> dict:
+    total_valid = max(1, quality["valid"])
+    below_target = quality["small"]
+    below_ideal = quality["below_ideal_resolution"]
+    severe = quality["severely_undersized"]
+    at_or_above_ideal = total_valid - below_ideal
+
+    counts = distribution["counts"]
+    below_min_class = sorted(
+        [c for c, n in counts.items() if 0 < n < MIN_RECOMMENDED_PER_CLASS]
+    )
+    below_ideal_class = sorted(
+        [c for c, n in counts.items() if 0 < n < IDEAL_PER_CLASS]
     )
 
-    corrupt_rate = (
-        quality["corrupt"]
-        / total
+    class_weights = compute_class_weights(counts)
+
+    return {
+        "model": MODEL_NAME,
+        "input_size": EFFNET_INPUT_SIZE,
+        "resize_size": EFFNET_RESIZE_SIZE,
+        "normalization_mean": EFFNET_NORM_MEAN,
+        "normalization_std": EFFNET_NORM_STD,
+        "normalization_note": (
+            "Standard ImageNet stats — correct for torchvision.models / timm "
+            "pretrained weights. tf.keras.applications.EfficientNetB3 bakes "
+            "rescaling into the model itself; don't double-normalize if using Keras."
+        ),
+        "resolution": {
+            "at_or_above_ideal_450px": at_or_above_ideal,
+            "at_or_above_ideal_450px_pct": pct(at_or_above_ideal, total_valid),
+            "below_target_300px": below_target,
+            "below_target_300px_pct": pct(below_target, total_valid),
+            "severely_undersized_150px": severe,
+            "severely_undersized_150px_pct": pct(severe, total_valid),
+        },
+        "class_sample_size": {
+            "min_recommended_per_class": MIN_RECOMMENDED_PER_CLASS,
+            "ideal_per_class": IDEAL_PER_CLASS,
+            "classes_below_minimum": below_min_class,
+            "classes_below_ideal": below_ideal_class,
+        },
+        "class_weights": class_weights,
+        "imbalance_ratio": ratio_text(imbalance["max"], imbalance["min"]),
+        "batch_size_guidance": [
+            {"gpu_memory": label, "suggested_batch_size": size}
+            for label, size in BATCH_SIZE_GUIDANCE
+        ],
+        "fine_tuning_notes": FINE_TUNING_NOTES,
+        "suggested_split": SUGGESTED_SPLIT_SHORT,
+    }
+
+
+def print_effnet_readiness(readiness: dict) -> None:
+    print_section(f"6. {readiness['model'].upper()} TRAINING READINESS")
+
+    print(f"Target input resolution : {readiness['input_size']}x{readiness['input_size']}")
+    print(f"Resize-then-crop        : resize shorter side to "
+          f"{readiness['resize_size']}, crop to {readiness['input_size']}")
+    print(f"Normalization mean      : {readiness['normalization_mean']}")
+    print(f"Normalization std       : {readiness['normalization_std']}")
+
+    res = readiness["resolution"]
+    print()
+    print("Resolution readiness:")
+    print(f"  >= ideal (450px)  : {res['at_or_above_ideal_450px']:,} ({res['at_or_above_ideal_450px_pct']})")
+    print(f"  < target (300px)  : {res['below_target_300px']:,} ({res['below_target_300px_pct']})")
+    print(f"  severely undersized (<150px) : {res['severely_undersized_150px']:,} "
+          f"({res['severely_undersized_150px_pct']})")
+
+    cls = readiness["class_sample_size"]
+    below_min = cls["classes_below_minimum"]
+    small_class_text = (
+        ", ".join(f"{c} ({label_for(c)})" for c in below_min) if below_min else "none"
     )
 
-    if corrupt_rate > 0:
-        deduction = min(
-            15,
-            math.ceil(corrupt_rate * 100),
-        )
+    print()
+    print("Training notes:")
+    print(f"  Small class size (< {cls['min_recommended_per_class']}) : {small_class_text}")
+    print(f"  Imbalance ratio (max:min)            : {readiness['imbalance_ratio']}")
+    print(f"  Suggested split                      : {readiness['suggested_split']}")
 
-        score -= deduction
-
-        deductions.append(
-            f"-{deduction} corrupt-image penalty"
-        )
-
-    # ------------------------------------------------------------
-    # Duplicate images
-    # ------------------------------------------------------------
-
-    duplicate_rate = (
-        duplicates["duplicate_files"]
-        / total
-    )
-
-    if duplicate_rate > 0:
-        deduction = min(
-            15,
-            math.ceil(duplicate_rate * 50),
-        )
-
-        score -= deduction
-
-        deductions.append(
-            f"-{deduction} duplicate penalty"
-        )
-
-    # Cross-class duplicates are more serious.
-    if duplicates["cross_class_groups"] > 0:
-
-        score -= min(
-            15,
-            duplicates["cross_class_groups"] * 3,
-        )
-
-        deductions.append(
-            "-cross-class duplicate penalty"
-        )
-
-    # ------------------------------------------------------------
-    # Small images
-    # ------------------------------------------------------------
-
-    small_rate = (
-        quality["small"]
-        / total
-    )
-
-    if small_rate > 0.10:
-
-        score -= 8
-        deductions.append(
-            "-8 low-resolution penalty"
-        )
-
-    elif small_rate > 0.03:
-
-        score -= 4
-        deductions.append(
-            "-4 low-resolution penalty"
-        )
-
-    # ------------------------------------------------------------
-    # Extreme aspect ratio
-    # ------------------------------------------------------------
-
-    aspect_rate = (
-        quality["extreme_aspect"]
-        / total
-    )
-
-    if aspect_rate > 0.10:
-
-        score -= 5
-        deductions.append(
-            "-5 aspect-ratio penalty"
-        )
-
-    # ------------------------------------------------------------
-    # Class imbalance
-    # ------------------------------------------------------------
-
-    imbalance = imbalance_analysis(
-        distribution["counts"]
-    )
-
-    if imbalance["max_to_min"] is not None:
-
-        if imbalance["max_to_min"] > 20:
-
-            score -= 10
-            deductions.append(
-                "-10 severe class-imbalance penalty"
-            )
-
-        elif imbalance["max_to_min"] > 10:
-
-            score -= 6
-            deductions.append(
-                "-6 class-imbalance penalty"
-            )
-
-        elif imbalance["max_to_min"] > 5:
-
-            score -= 3
-            deductions.append(
-                "-3 class-imbalance penalty"
-            )
-
-    return max(0, min(100, score)), deductions
+    print()
+    print(f"Class weights, batch-size guidance, and fine-tuning notes written to:\n  {TRAINING_CONFIG_JSON}")
 
 
 # ============================================================================
 # REPORT OUTPUT
 # ============================================================================
 
-def print_distribution_report(
-    distribution: dict,
-) -> None:
-
-    print_section(
-        "1. CLASS DISTRIBUTION"
-    )
-
-    print(
-        f"{'ID':>3}  "
-        f"{'Class':<60} "
-        f"{'Images':>10}"
-    )
-
+def print_distribution_report(distribution: dict) -> None:
+    print_section("1. CLASS DISTRIBUTION")
+    print(f"{'ID':>3}  {'Class':<60} {'Images':>10}")
     print("-" * 85)
 
     for class_id in sorted(LABELS):
-
-        count = distribution["counts"].get(
-            class_id,
-            0,
-        )
-
+        count = distribution["counts"].get(class_id, 0)
         status = "EMPTY" if count == 0 else ""
+        print(f"{class_id:>3}  {label_for(class_id):<60} {count:>10,} {status}")
 
-        print(
-            f"{class_id:>3}  "
-            f"{label_for(class_id):<60} "
-            f"{count:>10,} "
-            f"{status}"
-        )
-
-    unexpected = [
-        class_id
-        for class_id in distribution["counts"]
-        if class_id not in LABELS
-    ]
-
+    unexpected = [c for c in distribution["counts"] if c not in LABELS]
     if unexpected:
-
         print()
         print("NUMERIC FOLDERS NOT DEFINED IN label.txt:")
-
         for class_id in sorted(unexpected):
-
-            print(
-                f"  {class_id}: "
-                f"{distribution['counts'][class_id]:,} images"
-            )
+            print(f"  {class_id}: {distribution['counts'][class_id]:,} images")
 
     print("-" * 85)
-
-    print(
-        f"TOTAL IMAGES: "
-        f"{distribution['total']:,}"
-    )
+    print(f"TOTAL IMAGES: {distribution['total']:,}")
 
 
-def print_imbalance_report(
-    distribution: dict,
-) -> None:
+def print_imbalance_report(distribution: dict) -> None:
+    analysis = imbalance_analysis(distribution["counts"])
 
-    analysis = imbalance_analysis(
-        distribution["counts"]
-    )
-
-    print_section(
-        "2. CLASS IMBALANCE ANALYSIS"
-    )
-
-    print(
-        f"Smallest non-empty class : "
-        f"{analysis['min']:,}"
-    )
-
-    print(
-        f"Largest class            : "
-        f"{analysis['max']:,}"
-    )
-
-    print(
-        f"Median class size        : "
-        f"{analysis['median']:,.0f}"
-    )
-
-    print(
-        f"Mean class size          : "
-        f"{analysis['mean']:,.0f}"
-    )
+    print_section("2. CLASS IMBALANCE ANALYSIS")
+    print(f"Smallest non-empty class : {analysis['min']:,}")
+    print(f"Largest class            : {analysis['max']:,}")
+    print(f"Median class size        : {analysis['median']:,.0f}")
+    print(f"Mean class size          : {analysis['mean']:,.0f}")
 
     if analysis["max_to_min"] is not None:
-
-        print(
-            f"Max / Min ratio          : "
-            f"{analysis['max_to_min']:.2f}:1"
-        )
+        print(f"Max / Min ratio          : {ratio_text(analysis['max'], analysis['min'])}")
 
     if analysis["classes_below_50pct_median"]:
-
         print()
-        print(
-            "Classes below 50% of median:"
-        )
-
-        for class_id in (
-            analysis[
-                "classes_below_50pct_median"
-            ]
-        ):
-
-            print(
-                f"  {class_id}: "
-                f"{label_for(class_id)} "
-                f"({distribution['counts'][class_id]:,})"
-            )
+        print("Classes below 50% of median:")
+        for class_id in analysis["classes_below_50pct_median"]:
+            print(f"  {class_id}: {label_for(class_id)} "
+                  f"({distribution['counts'][class_id]:,})")
 
     if analysis["classes_above_2x_median"]:
-
         print()
-        print(
-            "Classes above 2x median:"
-        )
-
-        for class_id in (
-            analysis[
-                "classes_above_2x_median"
-            ]
-        ):
-
-            print(
-                f"  {class_id}: "
-                f"{label_for(class_id)} "
-                f"({distribution['counts'][class_id]:,})"
-            )
+        print("Classes above 2x median:")
+        for class_id in analysis["classes_above_2x_median"]:
+            print(f"  {class_id}: {label_for(class_id)} "
+                  f"({distribution['counts'][class_id]:,})")
 
 
-def print_quality_report(
-    quality: dict,
-) -> None:
+def print_quality_report(quality: dict) -> None:
+    print_section("3. IMAGE QUALITY / INTEGRITY")
+    total = max(1, quality["total_records"])
 
-    print_section(
-        "3. IMAGE QUALITY / INTEGRITY"
-    )
-
-    total = max(
-        1,
-        quality["total_records"],
-    )
-
-    print(
-        f"Valid images          : "
-        f"{quality['valid']:,} "
-        f"({pct(quality['valid'], total)})"
-    )
-
-    print(
-        f"Corrupt/unreadable     : "
-        f"{quality['corrupt']:,} "
-        f"({pct(quality['corrupt'], total)})"
-    )
-
-    print(
-        f"Small / low-res        : "
-        f"{quality['small']:,} "
-        f"({pct(quality['small'], total)})"
-    )
-
-    print(
-        f"Extreme aspect ratio   : "
-        f"{quality['extreme_aspect']:,} "
-        f"({pct(quality['extreme_aspect'], total)})"
-    )
-
-    print(
-        f"Grayscale              : "
-        f"{quality['grayscale']:,} "
-        f"({pct(quality['grayscale'], total)})"
-    )
-
-    print(
-        f"Images with alpha      : "
-        f"{quality['alpha']:,} "
-        f"({pct(quality['alpha'], total)})"
-    )
-
-    print(
-        f"Tiny files             : "
-        f"{quality['tiny_files']:,}"
-    )
-
-    print(
-        f"Large files > "
-        f"{LARGE_FILE_MB} MB      : "
-        f"{quality['large_files']:,}"
-    )
+    print(f"Valid images            : {quality['valid']:,} ({pct(quality['valid'], total)})")
+    print(f"Corrupt/unreadable      : {quality['corrupt']:,} ({pct(quality['corrupt'], total)})")
+    print(f"Below B3 target (300px) : {quality['small']:,} ({pct(quality['small'], total)})")
+    print(f"Below ideal (450px)     : {quality['below_ideal_resolution']:,} "
+          f"({pct(quality['below_ideal_resolution'], total)})")
+    print(f"Severely undersized     : {quality['severely_undersized']:,} "
+          f"({pct(quality['severely_undersized'], total)})")
+    print(f"Extreme aspect ratio    : {quality['extreme_aspect']:,} "
+          f"({pct(quality['extreme_aspect'], total)})")
+    print(f"Grayscale               : {quality['grayscale']:,} ({pct(quality['grayscale'], total)})")
+    print(f"Images with alpha       : {quality['alpha']:,} ({pct(quality['alpha'], total)})")
+    print(f"Tiny files              : {quality['tiny_files']:,}")
+    print(f"Large files > {LARGE_FILE_MB} MB    : {quality['large_files']:,}")
+    print(f"Total dataset size      : {human_size(quality['file_size']['total_bytes'])}")
 
     print()
-    print(
-        "Dimensions:"
-    )
-
-    print(
-        f"  Minimum width        : "
-        f"{quality['dimensions']['min_width']}"
-    )
-
-    print(
-        f"  Median width         : "
-        f"{quality['dimensions']['median_width']:,.0f}"
-    )
-
-    print(
-        f"  Minimum height       : "
-        f"{quality['dimensions']['min_height']}"
-    )
-
-    print(
-        f"  Median height        : "
-        f"{quality['dimensions']['median_height']:,.0f}"
-    )
-
-    print(
-        f"  Median pixels        : "
-        f"{quality['dimensions']['median_pixels']:,.0f}"
-    )
+    print("Dimensions:")
+    print(f"  Minimum width  : {quality['dimensions']['min_width']}")
+    print(f"  Median width   : {quality['dimensions']['median_width']:,.0f}")
+    print(f"  Minimum height : {quality['dimensions']['min_height']}")
+    print(f"  Median height  : {quality['dimensions']['median_height']:,.0f}")
+    print(f"  Median pixels  : {quality['dimensions']['median_pixels']:,.0f}")
 
     print()
-    print(
-        "Aspect ratio:"
-    )
-
-    print(
-        f"  Minimum              : "
-        f"{quality['aspect_ratio']['minimum']:.3f}"
-    )
-
-    print(
-        f"  Median               : "
-        f"{quality['aspect_ratio']['median']:.3f}"
-    )
-
-    print(
-        f"  Maximum              : "
-        f"{quality['aspect_ratio']['maximum']:.3f}"
-    )
+    print("Aspect ratio:")
+    print(f"  Minimum : {quality['aspect_ratio']['minimum']:.3f}")
+    print(f"  Median  : {quality['aspect_ratio']['median']:.3f}")
+    print(f"  Maximum : {quality['aspect_ratio']['maximum']:.3f}")
 
     print()
-    print(
-        "Formats:"
-    )
-
-    for fmt, count in sorted(
-        quality["formats"].items(),
-        key=lambda item: item[1],
-        reverse=True,
-    ):
-
-        print(
-            f"  {fmt:<10} "
-            f"{count:>8,} "
-            f"({pct(count, quality['valid'])})"
-        )
+    print("Formats:")
+    for fmt, count in sorted(quality["formats"].items(), key=lambda x: x[1], reverse=True):
+        print(f"  {fmt:<10} {count:>8,} ({pct(count, quality['valid'])})")
 
     print()
-    print(
-        "Image modes:"
-    )
-
-    for mode, count in sorted(
-        quality["modes"].items(),
-        key=lambda item: item[1],
-        reverse=True,
-    ):
-
-        print(
-            f"  {str(mode):<10} "
-            f"{count:>8,} "
-            f"({pct(count, quality['valid'])})"
-        )
+    print("Image modes:")
+    for mode, count in sorted(quality["modes"].items(), key=lambda x: x[1], reverse=True):
+        print(f"  {str(mode):<10} {count:>8,} ({pct(count, quality['valid'])})")
 
 
-def print_class_quality_report(
-    stats_by_class: dict,
-) -> None:
-
-    print_section(
-        "4. PER-CLASS QUALITY PROFILE"
-    )
-
-    print(
-        f"{'ID':>3} "
-        f"{'Class':<45} "
-        f"{'Valid':>8} "
-        f"{'Bad':>6} "
-        f"{'Small':>7} "
-        f"{'Gray':>7} "
-        f"{'Aspect':>8}"
-    )
-
+def print_class_quality_report(stats_by_class: dict) -> None:
+    print_section("4. PER-CLASS QUALITY PROFILE")
+    print(f"{'ID':>3} {'Class':<40} {'Valid':>8} {'Bad':>6} {'<300px':>7} "
+          f"{'Gray':>7} {'Aspect':>8}")
     print("-" * 95)
 
     for class_id in sorted(LABELS):
+        stats = stats_by_class.get(class_id, {
+            "valid": 0, "corrupt": 0, "small": 0, "grayscale": 0, "extreme_aspect": 0,
+        })
 
-        stats = stats_by_class.get(
-            class_id,
-            {
-                "total": 0,
-                "valid": 0,
-                "corrupt": 0,
-                "small": 0,
-                "grayscale": 0,
-                "extreme_aspect": 0,
-            },
-        )
-
-        print(
-            f"{class_id:>3} "
-            f"{label_for(class_id):<45} "
-            f"{stats['valid']:>8,} "
-            f"{stats['corrupt']:>6,} "
-            f"{stats['small']:>7,} "
-            f"{stats['grayscale']:>7,} "
-            f"{stats['extreme_aspect']:>8,}"
-        )
+        print(f"{class_id:>3} {label_for(class_id):<40} {stats['valid']:>8,} "
+              f"{stats['corrupt']:>6,} {stats['small']:>7,} {stats['grayscale']:>7,} "
+              f"{stats['extreme_aspect']:>8,}")
 
 
-def print_duplicate_report(
-    duplicates: dict,
-) -> None:
+def print_duplicate_report(duplicates: dict) -> None:
+    print_section("5. DUPLICATE / DATA LEAKAGE ANALYSIS")
 
-    print_section(
-        "5. DUPLICATE / DATA LEAKAGE ANALYSIS"
-    )
+    exact = duplicates["exact"]
+    visual = duplicates["visual"]
+    near = duplicates["near_duplicates"]
 
-    print(
-        f"Unique SHA-256 hashes    : "
-        f"{duplicates['unique_hashes']:,}"
-    )
+    print("Exact (byte-identical, SHA-256):")
+    print(f"  Unique hashes    : {exact['unique_hashes']:,}")
+    print(f"  Duplicate groups : {exact['duplicate_groups']:,}")
+    print(f"  Duplicate files  : {exact['duplicate_files']:,}")
+    print(f"  Cross-class      : {exact['cross_class_groups']:,}")
 
-    print(
-        f"Duplicate groups         : "
-        f"{duplicates['duplicate_groups']:,}"
-    )
+    print()
+    print("Visual (perceptual dHash, catches resized/recompressed copies):")
+    print(f"  Unique hashes    : {visual['unique_hashes']:,}")
+    print(f"  Duplicate groups : {visual['duplicate_groups']:,}")
+    print(f"  Duplicate files  : {visual['duplicate_files']:,}")
+    print(f"  Cross-class      : {visual['cross_class_groups']:,}")
 
-    print(
-        f"Duplicate files          : "
-        f"{duplicates['duplicate_files']:,}"
-    )
+    print()
+    print(f"Near-duplicate pairs (Hamming <= {NEAR_DUP_HAMMING_THRESHOLD}, within-class): "
+          f"{near['pair_count']:,}")
+    if near["skipped_classes"]:
+        skipped = ", ".join(label_for(c) for c in near["skipped_classes"])
+        print(f"  Skipped (too large for pairwise scan): {skipped}")
 
-    print(
-        f"Within-class duplicates  : "
-        f"{duplicates['within_class_groups']:,}"
-    )
-
-    print(
-        f"Cross-class duplicates   : "
-        f"{duplicates['cross_class_groups']:,}"
-    )
-
-    if duplicates["cross_class_groups"]:
-
+    if exact["cross_class_groups"] or visual["cross_class_groups"]:
         print()
-        print(
-            "!!! CRITICAL: CROSS-CLASS DUPLICATES FOUND !!!"
-        )
+        print("!!! CRITICAL: cross-class duplicates found !!!")
+        print("The same image (or a near-identical copy) appears under different labels.")
 
-        print(
-            "The same exact image appears under different labels."
-        )
-
-        print(
-            "These should be resolved before model training."
-        )
-
-        for example in duplicates[
-            "cross_class_examples"
-        ]:
-
-            print()
-            print(
-                f"Hash: {example['sha256'][:16]}..."
-            )
-
+        for example in exact["cross_class_examples"]:
+            print(f"\n  [exact] hash {example['sha256'][:16]}...")
             for item in example["files"]:
+                print(f"    Class {item['class_id']} ({label_for(item['class_id'])}): {item['path']}")
 
-                print(
-                    f"  Class {item['class_id']} "
-                    f"({label_for(item['class_id'])}): "
-                    f"{item['path']}"
-                )
-
-
+        for example in visual["cross_class_examples"]:
+            print(f"\n  [visual] dhash {example['dhash']}")
+            for item in example["files"]:
+                print(f"    Class {item['class_id']} ({label_for(item['class_id'])}): {item['path']}")
 
 
 # ============================================================================
 # DUPLICATE REVIEW / OPTIONAL REMOVAL
 # ============================================================================
 
-def remove_duplicates_interactively(records: list[dict], duplicates: dict) -> dict:
-    """Show exact duplicate groups with full paths and ask before deleting."""
-    groups = duplicates.get("groups", {})
-    result = {"within_class_removed": 0, "cross_class_removed": 0, "removed_paths": []}
-    if not groups:
-        return result
+def remove_duplicates_interactively(duplicates: dict, interactive: bool) -> dict:
+    """Show exact + visual duplicate groups and, if interactive, ask before
+    deleting. With --no-interactive, this only reports (removes nothing) —
+    useful for running the audit in a script/CI without blocking on input()."""
 
-    within_groups = []
-    cross_groups = []
-    for digest, items in groups.items():
-        class_ids = {item["class_id"] for item in items}
-        (within_groups if len(class_ids) == 1 else cross_groups).append((digest, items))
+    result = {"exact_removed": 0, "visual_removed": 0, "removed_paths": []}
+
+    exact_groups = duplicates["exact"]["groups"]
+    visual_groups = duplicates["visual"]["groups"]
+
+    if not exact_groups and not visual_groups:
+        return result
 
     print_section("DUPLICATE FILE DETAILS")
 
-    print()
-    print(f"WITHIN-CLASS EXACT DUPLICATES: {len(within_groups):,} group(s)")
-    print("Same image content appears multiple times inside the same class.")
-    for number, (digest, items) in enumerate(within_groups, 1):
-        print(f"\n[Within-class group {number}]\nSHA-256: {digest}")
-        for index, item in enumerate(items):
-            status = "KEEP" if index == 0 else "DUPLICATE"
-            print(f"  [{status}] Class {item['class_id']} - {label_for(item['class_id'])}")
-            print(f"         {item['path']}")
+    def show_and_maybe_remove(groups: dict, label: str, result_key: str) -> None:
+        if not groups:
+            return
 
-    print()
-    print(f"CROSS-CLASS EXACT DUPLICATES: {len(cross_groups):,} group(s)")
-    print("The exact same image appears under different class labels.")
-    for number, (digest, items) in enumerate(cross_groups, 1):
-        print(f"\n[Cross-class group {number}]\nSHA-256: {digest}")
-        for index, item in enumerate(items):
-            status = "FIRST" if index == 0 else "DUPLICATE"
-            print(f"  [{status}] Class {item['class_id']} - {label_for(item['class_id'])}")
-            print(f"         {item['path']}")
-
-    if within_groups:
         print()
-        answer = input("Remove WITHIN-CLASS exact duplicates, keeping the first file in each group? [y/N]: ").strip().lower()
-        if answer == "y":
-            for digest, items in within_groups:
-                for item in items[1:]:
-                    file_path = Path(item["path"])
-                    try:
-                        if file_path.exists():
-                            file_path.unlink()
-                            result["within_class_removed"] += 1
-                            result["removed_paths"].append(str(file_path))
-                            print(f"Removed: {file_path}")
-                    except Exception as error:
-                        print(f"Could not remove {file_path}: {error}")
-        else:
-            print("Within-class duplicates were NOT removed.")
+        print(f"{label}: {len(groups):,} group(s)")
 
-    if cross_groups:
-        print()
-        print("WARNING: Cross-class duplicates may represent the same image assigned different labels.")
-        answer = input("Remove CROSS-CLASS exact duplicates, keeping the first file in each group? [y/N]: ").strip().lower()
-        if answer == "y":
-            for digest, items in cross_groups:
-                for item in items[1:]:
-                    file_path = Path(item["path"])
-                    try:
-                        if file_path.exists():
-                            file_path.unlink()
-                            result["cross_class_removed"] += 1
-                            result["removed_paths"].append(str(file_path))
-                            print(f"Removed: {file_path}")
-                    except Exception as error:
-                        print(f"Could not remove {file_path}: {error}")
-        else:
-            print("Cross-class duplicates were NOT removed.")
+        for number, (digest, items) in enumerate(groups.items(), 1):
+            print(f"\n[{label} group {number}] {digest if isinstance(digest, str) else f'{digest:016x}'}")
+            for index, item in enumerate(items):
+                status = "KEEP" if index == 0 else "DUPLICATE"
+                print(f"  [{status}] Class {item['class_id']} ({label_for(item['class_id'])})")
+                print(f"         {item['relative_path']}")
+
+        if not interactive:
+            print(f"  (--no-interactive: {label.lower()} were NOT removed)")
+            return
+
+        answer = input(
+            f"Remove {label.lower()}, keeping the first file in each group? [y/N]: "
+        ).strip().lower()
+
+        if answer != "y":
+            print(f"{label} were NOT removed.")
+            return
+
+        for digest, items in groups.items():
+            for item in items[1:]:
+                file_path = Path(item["path"])
+                try:
+                    if file_path.exists():
+                        file_path.unlink()
+                        result[result_key] += 1
+                        result["removed_paths"].append(str(file_path))
+                        print(f"Removed: {file_path}")
+                except Exception as error:
+                    print(f"Could not remove {file_path}: {error}")
+
+    show_and_maybe_remove(exact_groups, "EXACT DUPLICATES", "exact_removed")
+    show_and_maybe_remove(visual_groups, "VISUAL DUPLICATES", "visual_removed")
 
     print()
     print("Duplicate review complete.")
-    print(f"Within-class removed : {result['within_class_removed']:,}")
-    print(f"Cross-class removed  : {result['cross_class_removed']:,}")
+    print(f"Exact removed  : {result['exact_removed']:,}")
+    print(f"Visual removed : {result['visual_removed']:,}")
+
     return result
 
 
 # ============================================================================
-# JSON REPORT
+# JSON REPORTS
 # ============================================================================
 
 def write_json_report(
@@ -1598,22 +1128,16 @@ def write_json_report(
     quality: dict,
     class_quality: dict,
     duplicates: dict,
+    readiness: dict,
     health_score: int,
-    recommendations: list[str],
-    removal_result: dict | None = None,
+    removal_result: dict,
 ) -> None:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-    REPORT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # Duplicate groups contain Path objects indirectly only in records,
-    # but our stored cross-class examples are already serializable.
-    duplicate_json = {
-        key: value
-        for key, value in duplicates.items()
-        if key != "groups"
+    duplicates_json = {
+        "exact": {k: v for k, v in duplicates["exact"].items() if k != "groups"},
+        "visual": {k: v for k, v in duplicates["visual"].items() if k != "groups"},
+        "near_duplicates": duplicates["near_duplicates"],
     }
 
     report = {
@@ -1625,39 +1149,158 @@ def write_json_report(
         "completeness": completeness,
         "quality": quality,
         "class_quality": class_quality,
-        "duplicates": duplicate_json,
+        "duplicates": duplicates_json,
+        "effnet_b3_readiness": readiness,
         "health_score": health_score,
-        "recommendations": [],
-        "duplicate_removal": removal_result or {"within_class_removed": 0, "cross_class_removed": 0, "removed_paths": []},
+        "duplicate_removal": removal_result,
         "configuration": {
-            "min_width": MIN_WIDTH,
-            "min_height": MIN_HEIGHT,
+            "min_acceptable_size": MIN_ACCEPTABLE_SIZE,
+            "ideal_source_size": IDEAL_SOURCE_SIZE,
+            "severely_undersized": SEVERELY_UNDERSIZED,
             "min_pixels": MIN_PIXELS,
             "min_aspect_ratio": MIN_ASPECT_RATIO,
             "max_aspect_ratio": MAX_ASPECT_RATIO,
             "large_file_mb": LARGE_FILE_MB,
             "tiny_file_kb": TINY_FILE_KB,
+            "near_dup_hamming_threshold": NEAR_DUP_HAMMING_THRESHOLD,
         },
     }
 
-    REPORT_JSON.write_text(
-        json.dumps(
-            report,
-            indent=2,
-            default=str,
-        ),
-        encoding="utf-8",
+    REPORT_JSON.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+
+
+def write_training_config(readiness: dict, distribution: dict) -> None:
+    """Small, stable config a training script can load directly —
+    separate from the full audit so it doesn't need to parse the whole
+    report just to get input_size / normalization / class_weights."""
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    config = {
+        "model": readiness["model"],
+        "num_classes": len(LABELS),
+        "class_names": {str(k): v for k, v in LABELS.items()},
+        "input_size": readiness["input_size"],
+        "resize_size": readiness["resize_size"],
+        "normalization_mean": readiness["normalization_mean"],
+        "normalization_std": readiness["normalization_std"],
+        "class_weights": {str(k): v for k, v in readiness["class_weights"].items()},
+        "class_counts": {str(k): v for k, v in distribution["counts"].items()},
+        "suggested_batch_sizes": readiness["batch_size_guidance"],
+        "suggested_split": readiness["suggested_split"],
+    }
+
+    TRAINING_CONFIG_JSON.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+# ============================================================================
+# HEALTH SCORE
+# ============================================================================
+
+def calculate_health_score(
+    distribution: dict, quality: dict, duplicates: dict
+) -> tuple[int, list[str]]:
+    score = 100
+    notes = []
+    total = max(1, quality["total_records"])
+
+    corrupt_rate = quality["corrupt"] / total
+    if corrupt_rate > 0:
+        deduction = min(15, math.ceil(corrupt_rate * 100))
+        score -= deduction
+        notes.append(f"-{deduction} corrupt-image penalty")
+
+    exact = duplicates["exact"]
+    visual = duplicates["visual"]
+
+    dup_rate = exact["duplicate_files"] / total
+    if dup_rate > 0:
+        deduction = min(15, math.ceil(dup_rate * 50))
+        score -= deduction
+        notes.append(f"-{deduction} exact-duplicate penalty")
+
+    if exact["cross_class_groups"] > 0:
+        deduction = min(15, exact["cross_class_groups"] * 3)
+        score -= deduction
+        notes.append(f"-{deduction} exact cross-class-duplicate penalty")
+
+    if visual["cross_class_groups"] > 0:
+        deduction = min(15, visual["cross_class_groups"] * 2)
+        score -= deduction
+        notes.append(f"-{deduction} visual cross-class-duplicate penalty")
+
+    small_rate = quality["small"] / total
+    if small_rate > 0.10:
+        score -= 8
+        notes.append("-8 low-resolution penalty (>10% below 300px)")
+    elif small_rate > 0.03:
+        score -= 4
+        notes.append("-4 low-resolution penalty (>3% below 300px)")
+
+    severe_rate = quality["severely_undersized"] / total
+    if severe_rate > 0.02:
+        score -= 5
+        notes.append("-5 severely-undersized penalty (>2% below 150px)")
+
+    aspect_rate = quality["extreme_aspect"] / total
+    if aspect_rate > 0.10:
+        score -= 5
+        notes.append("-5 aspect-ratio penalty")
+
+    imbalance = imbalance_analysis(distribution["counts"])
+    if imbalance["max_to_min"] is not None:
+        if imbalance["max_to_min"] > 20:
+            score -= 10
+            notes.append("-10 severe class-imbalance penalty")
+        elif imbalance["max_to_min"] > 10:
+            score -= 6
+            notes.append("-6 class-imbalance penalty")
+        elif imbalance["max_to_min"] > 5:
+            score -= 3
+            notes.append("-3 class-imbalance penalty")
+
+    return max(0, min(100, score)), notes
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="FieldCare dataset audit — tuned for EfficientNet-B3 training readiness."
     )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Parallel worker processes for image inspection (default: CPU count - 1)",
+    )
+    parser.add_argument(
+        "--no-interactive", action="store_true",
+        help="Report duplicates without prompting to delete anything (safe for CI/scripts).",
+    )
+    parser.add_argument(
+        "--near-dup-threshold", type=int, default=NEAR_DUP_HAMMING_THRESHOLD,
+        help=f"Hamming distance threshold for near-duplicate detection (0-64, default {NEAR_DUP_HAMMING_THRESHOLD}).",
+    )
+    parser.add_argument(
+        "--logs-dir", type=Path, default=DEFAULT_LOG_DIR,
+        help=f"Directory for timestamped audit logs (default: {DEFAULT_LOG_DIR}).",
+    )
+    return parser.parse_args(argv)
 
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
-def main():
+def run_audit(args: argparse.Namespace):
+
+    global NEAR_DUP_HAMMING_THRESHOLD
+    NEAR_DUP_HAMMING_THRESHOLD = args.near_dup_threshold
+
+    workers = args.workers or max(1, (os.cpu_count() or 4) - 1)
 
     print("=" * 80)
-    print("                 FIELDCARE DATASET AUDIT v2")
+    print("                 FIELDCARE DATASET AUDIT v3 (EfficientNet-B3)")
     print("=" * 80)
 
     print()
@@ -1666,159 +1309,55 @@ def main():
     print(f"Classes loaded from label.txt: {len(LABELS)}")
 
     if not DATASET.exists():
-
         print()
-        print(
-            "ERROR: Dataset directory does not exist."
-        )
-
+        print("ERROR: Dataset directory does not exist.")
         return 1
-
-    # ------------------------------------------------------------
-    # Collect
-    # ------------------------------------------------------------
 
     print()
     print("Scanning class folders...")
-
     class_files = collect_files()
 
-    # ------------------------------------------------------------
-    # Distribution
-    # ------------------------------------------------------------
+    distribution = audit_distribution(class_files)
+    print_distribution_report(distribution)
+    print_imbalance_report(distribution)
 
-    distribution = audit_distribution(
-        class_files
-    )
-
-    print_distribution_report(
-        distribution,
-    )
-
-    # ------------------------------------------------------------
-    # Imbalance
-    # ------------------------------------------------------------
-
-    print_imbalance_report(
-        distribution
-    )
-
-    # ------------------------------------------------------------
-    # Completeness
-    # ------------------------------------------------------------
-
-    completeness = completeness_analysis(
-        distribution["counts"]
-    )
-
-    print_section(
-        "DATASET COMPLETENESS"
-    )
-
-    print(
-        f"Expected classes       : "
-        f"{completeness['expected_classes']}"
-    )
-
-    print(
-        f"Classes with images     : "
-        f"{completeness['classes_with_images']}"
-    )
+    completeness = completeness_analysis(distribution["counts"])
+    print_section("DATASET COMPLETENESS")
+    print(f"Expected classes     : {completeness['expected_classes']}")
+    print(f"Classes with images  : {completeness['classes_with_images']}")
 
     if completeness["empty_classes"]:
-
         print()
-        print(
-            "EMPTY / MISSING CLASSES:"
-        )
-
-        for class_id in completeness[
-            "empty_classes"
-        ]:
-
-            print(
-                f"  {class_id}: "
-                f"{label_for(class_id)}"
-            )
-
+        print("EMPTY / MISSING CLASSES:")
+        for class_id in completeness["empty_classes"]:
+            print(f"  {class_id}: {label_for(class_id)}")
     else:
+        print("All expected classes contain images.")
 
-        print(
-            "All expected classes contain images."
-        )
-
-    if completeness[
-        "unexpected_numeric_folders"
-    ]:
-
+    if completeness["unexpected_numeric_folders"]:
         print()
-        print(
-            "UNEXPECTED NUMERIC CLASS FOLDERS:"
-        )
+        print("UNEXPECTED NUMERIC CLASS FOLDERS:")
+        for class_id in completeness["unexpected_numeric_folders"]:
+            print(f"  {class_id}")
 
-        for class_id in completeness[
-            "unexpected_numeric_folders"
-        ]:
+    class_quality, records = audit_image_quality(class_files, workers)
+    quality = global_quality_summary(records)
+    print_quality_report(quality)
+    print_class_quality_report(class_quality)
 
-            print(
-                f"  {class_id}"
-            )
+    duplicates = audit_duplicates(records)
+    print_duplicate_report(duplicates)
 
-    # ------------------------------------------------------------
-    # Image quality
-    # ------------------------------------------------------------
+    removal_result = remove_duplicates_interactively(duplicates, interactive=not args.no_interactive)
 
-    class_quality, records = audit_image_quality(
-        class_files
-    )
+    imbalance = imbalance_analysis(distribution["counts"])
+    readiness = effnet_readiness_report(quality, distribution, imbalance)
+    print_effnet_readiness(readiness)
 
-    quality = global_quality_summary(
-        records
-    )
+    health_score, score_notes = calculate_health_score(distribution, quality, duplicates)
 
-    print_quality_report(
-        quality
-    )
-
-    print_class_quality_report(
-        class_quality
-    )
-
-    # ------------------------------------------------------------
-    # Duplicate analysis
-    # ------------------------------------------------------------
-
-    duplicates = audit_duplicates(
-        records
-    )
-
-    # ------------------------------------------------------------
-    # Duplicate review / optional removal
-    # ------------------------------------------------------------
-
-    removal_result = remove_duplicates_interactively(
-        records,
-        duplicates,
-    )
-
-    # ------------------------------------------------------------
-    # Health score
-    # ------------------------------------------------------------
-
-    health_score, score_notes = calculate_health_score(
-        distribution,
-        quality,
-        duplicates,
-    )
-
-    print_section(
-        "6. DATASET HEALTH SCORE"
-    )
-
-    print(
-        f"FIELDCARE DATASET HEALTH SCORE: "
-        f"{health_score}/100"
-    )
+    print_section("7. DATASET HEALTH SCORE")
+    print(f"FIELDCARE DATASET HEALTH SCORE: {health_score}/100")
 
     if health_score >= 90:
         interpretation = "EXCELLENT"
@@ -1831,68 +1370,91 @@ def main():
     else:
         interpretation = "POOR"
 
-    print(
-        f"Overall status: {interpretation}"
-    )
+    print(f"Overall status: {interpretation}")
 
     if score_notes:
-
         print()
-        print(
-            "Score factors:"
-        )
-
+        print("Score factors:")
         for note in score_notes:
-            print(
-                f"  {note}"
-            )
+            print(f"  {note}")
 
-    # ------------------------------------------------------------
-    # Recommendations
-    # ------------------------------------------------------------
-
-    # ------------------------------------------------------------
-    # Save JSON
-    # ------------------------------------------------------------
-
-    imbalance = imbalance_analysis(
-        distribution["counts"]
-    )
-
+    write_training_config(readiness, distribution)
     write_json_report(
-        distribution,
-        imbalance,
-        completeness,
-        quality,
-        class_quality,
-        duplicates,
-        health_score,
-        [],
-        removal_result,
+        distribution, imbalance, completeness, quality, class_quality,
+        duplicates, readiness, health_score, removal_result,
     )
 
     print()
     print("=" * 80)
     print("AUDIT COMPLETE")
     print("=" * 80)
-
     print()
-    print(
-        f"JSON report saved to:\n"
-        f"  {REPORT_JSON}"
-    )
+    print(f"Full JSON report saved to:\n  {REPORT_JSON}")
+    print(f"Training config saved to:\n  {TRAINING_CONFIG_JSON}")
 
-    removed_total = (
-        removal_result["within_class_removed"]
-        + removal_result["cross_class_removed"]
-    )
-
+    removed_total = removal_result["exact_removed"] + removal_result["visual_removed"]
     print()
     print(f"Files removed during this run: {removed_total:,}")
     if removed_total:
         print("Run the audit again for a fresh post-removal report.")
 
     return 0
+
+
+class TeeStream:
+    """Write console output to both the terminal and a persistent log file."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
+    @property
+    def encoding(self):
+        return getattr(self.streams[0], "encoding", "utf-8")
+
+
+def main():
+    args = parse_args()
+    logs_dir = args.logs_dir.resolve()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    console_log = logs_dir / f"{timestamp}_dataset_audit.log"
+    audit_json_log = logs_dir / f"{timestamp}_dataset_audit.json"
+    training_config_log = logs_dir / f"{timestamp}_effnet_b3_training_config.json"
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    with console_log.open("w", encoding="utf-8") as log_stream:
+        sys.stdout = TeeStream(original_stdout, log_stream)
+        sys.stderr = TeeStream(original_stderr, log_stream)
+        try:
+            result = run_audit(args)
+            if result == 0:
+                shutil.copy2(REPORT_JSON, audit_json_log)
+                shutil.copy2(TRAINING_CONFIG_JSON, training_config_log)
+                print()
+                print("Timestamped audit logs saved to:")
+                print(f"  Console log    : {console_log}")
+                print(f"  Audit JSON     : {audit_json_log}")
+                print(f"  Training config: {training_config_log}")
+            else:
+                print(f"Audit failed; console output was retained at: {console_log}")
+            return result
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
 
 if __name__ == "__main__":

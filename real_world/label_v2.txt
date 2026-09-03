@@ -1,0 +1,11 @@
+6_Corn_Gray_Leaf_Spot_f24aaced4f1c.jpg 1
+3_Corn_Northern_Leaf_Blight_6cffd71043ef.jpg 4
+notherleafblight.jpg 4
+12_Tomato_Bacterial_Spot_4874eb88f854.jpg 16
+12_Tomato_Bacterial_Spot_67f7847de548.webp 16
+13_Tomato_Early_Blight_7e54f19591cf.jpg 17
+healthytomato.jpg 18
+14_Tomato_Late_Blight_534abc208959.jpg 19
+14_Tomato_Late_Blight_9b7c66837af4.jpg 19
+15_Tomato_Leaf_Mold_505f8fa6d8cc.jpg 20
+15_Tomato_Leaf_Mold_78a46a924f1a.jpg 20

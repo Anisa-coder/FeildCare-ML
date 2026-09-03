@@ -2,10 +2,12 @@
 
 __pycache__/
 *.pyc
-
+kaggle_upload/*
 _dataset_downloads/
-
+logs/*
 dataset/*
+dataset_v2/*
+dataset_v2.docker.tar
 !dataset/label.txt
 
 real_world/images/
@@ -14,3 +16,8 @@ real_world/results/
 models/*.pth
 
 *.log
+output/
+outputs/
+*.exe
+*.zip
+config.json
