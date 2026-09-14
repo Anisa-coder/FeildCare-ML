@@ -18,6 +18,8 @@ models/*.pth
 *.log
 output/
 outputs/
+data/*.db
+data/*.db-*
 *.exe
 *.zip
 config.json

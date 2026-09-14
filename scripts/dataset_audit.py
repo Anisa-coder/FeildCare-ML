@@ -46,50 +46,43 @@ TRAINING_CONFIG_JSON = REPORT_DIR / "effnet_b3_training_config.json"
 
 DEFAULT_LOG_DIR = LOGS_ROOT / "dataset_audit"
 
-LABEL_FILE = DATASET / "label.txt"
+LABEL_FILE = DATASET / "labels.json"
 
 
-def load_labels() -> dict[int, str]:
-    """Load class IDs and names directly from dataset/label.txt."""
-    if not LABEL_FILE.exists():
-        raise FileNotFoundError(f"label.txt not found: {LABEL_FILE}")
-
-    labels: dict[int, str] = {}
-
-    for line_number, raw_line in enumerate(
-        LABEL_FILE.read_text(encoding="utf-8").splitlines(), start=1
-    ):
-        line = raw_line.strip()
-
-        if not line or line.startswith("#"):
-            continue
-
-        parts = line.split(maxsplit=1)
-
-        if len(parts) != 2 or not parts[0].isdigit():
-            raise ValueError(
-                f"Invalid label.txt line {line_number}: {raw_line!r}\n"
-                "Expected: <number> <class name>"
-            )
-
-        class_id = int(parts[0])
-        class_name = parts[1].strip()
-
-        if class_id <= 0:
-            raise ValueError(f"Invalid class ID {class_id} on line {line_number}.")
-
-        if class_id in labels:
-            raise ValueError(f"Duplicate class ID {class_id} in label.txt.")
-
-        labels[class_id] = class_name
-
-    if not labels:
+def load_dataset_metadata() -> tuple[dict[int, str], dict[int, Path]]:
+    """Load class names and directories from the standardized v2 metadata."""
+    if not LABEL_FILE.is_file():
+        raise FileNotFoundError(
+            f"labels.json not found: {LABEL_FILE}. Expected the standardized "
+            "dataset layout under dataset/."
+        )
+    payload = json.loads(LABEL_FILE.read_text(encoding="utf-8"))
+    raw_classes = payload.get("classes")
+    if not isinstance(raw_classes, list) or not raw_classes:
         raise ValueError(f"No classes found in {LABEL_FILE}")
 
-    return dict(sorted(labels.items()))
+    labels: dict[int, str] = {}
+    directories: dict[int, Path] = {}
+    for item in raw_classes:
+        try:
+            class_id = int(item["id"])
+            class_index = int(item["index"])
+            class_name = str(item["display_name"]).strip()
+            relative_directory = Path(str(item["relative_directory"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid class record in {LABEL_FILE}: {item!r}") from exc
+        if class_id != class_index + 1 or class_id in labels or not class_name:
+            raise ValueError(f"Invalid or duplicate class record in {LABEL_FILE}: {item!r}")
+        labels[class_id] = class_name
+        directories[class_id] = DATASET / relative_directory
+
+    expected_ids = list(range(1, len(labels) + 1))
+    if sorted(labels) != expected_ids:
+        raise ValueError("Class IDs in labels.json must be contiguous and start at 1")
+    return labels, directories
 
 
-LABELS = load_labels()
+LABELS, CLASS_DIRECTORIES = load_dataset_metadata()
 
 
 # ============================================================================
@@ -201,12 +194,9 @@ def iter_class_images():
     if not DATASET.exists():
         return
 
-    for folder in DATASET.iterdir():
-        if not folder.is_dir() or not folder.name.isdigit():
+    for class_id, folder in CLASS_DIRECTORIES.items():
+        if not folder.is_dir():
             continue
-
-        class_id = int(folder.name)
-
         for image in folder.rglob("*"):
             if is_image(image):
                 yield class_id, image
@@ -759,7 +749,7 @@ def completeness_analysis(counts: dict) -> dict:
         "expected_classes": len(expected),
         "classes_with_images": sum(counts.get(c, 0) > 0 for c in expected),
         "empty_classes": sorted(c for c in expected if counts.get(c, 0) == 0),
-        "unexpected_numeric_folders": sorted(c for c in actual if c not in expected),
+        "unexpected_class_ids": sorted(c for c in actual if c not in expected),
     }
 
 
@@ -911,7 +901,7 @@ def print_distribution_report(distribution: dict) -> None:
     unexpected = [c for c in distribution["counts"] if c not in LABELS]
     if unexpected:
         print()
-        print("NUMERIC FOLDERS NOT DEFINED IN label.txt:")
+        print("CLASS IDS NOT DEFINED IN labels.json:")
         for class_id in sorted(unexpected):
             print(f"  {class_id}: {distribution['counts'][class_id]:,} images")
 
@@ -1306,7 +1296,7 @@ def run_audit(args: argparse.Namespace):
     print()
     print(f"Dataset root: {DATASET}")
     print(f"Label source: {LABEL_FILE}")
-    print(f"Classes loaded from label.txt: {len(LABELS)}")
+    print(f"Classes loaded from labels.json: {len(LABELS)}")
 
     if not DATASET.exists():
         print()
@@ -1334,10 +1324,10 @@ def run_audit(args: argparse.Namespace):
     else:
         print("All expected classes contain images.")
 
-    if completeness["unexpected_numeric_folders"]:
+    if completeness["unexpected_class_ids"]:
         print()
-        print("UNEXPECTED NUMERIC CLASS FOLDERS:")
-        for class_id in completeness["unexpected_numeric_folders"]:
+        print("UNEXPECTED CLASS IDS:")
+        for class_id in completeness["unexpected_class_ids"]:
             print(f"  {class_id}")
 
     class_quality, records = audit_image_quality(class_files, workers)
